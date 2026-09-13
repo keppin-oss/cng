@@ -17,13 +17,14 @@ const testLifecycleKeyName = "Keppin.OSS.Test.CNG.Lifecycle.v1"
 
 // TestSmokeKeyLifecycle exercises the real persisted machine-scoped key end to
 // end: create/open, sign, verify, delete, confirm absent, and repeat. It is
-// gated behind the cng_smoke build tag and requires an elevated (Administrator)
-// process, so it is never run by `go test ./...`.
+// gated behind the cng_smoke build tag and needs a Windows context authorized
+// for the key operations. It is not run by `go test ./...` without that tag.
 func TestSmokeKeyLifecycle(t *testing.T) {
-	// Probe elevation by creating the test key once; skip if not elevated.
+	// Attempt to acquire the test key. Any acquisition error skips the test;
+	// this does not establish that the process lacks elevation.
 	signer, err := LoadOrCreate(testLifecycleKeyName)
 	if err != nil {
-		t.Skipf("skipping cng smoke test (requires elevated process): %v — NOT EXECUTED", err)
+		t.Skipf("skipping cng smoke test: initial LoadOrCreate failed: %v — lifecycle iterations NOT EXECUTED", err)
 	}
 	_ = signer.Close()
 

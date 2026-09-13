@@ -5,9 +5,9 @@
 // creates a replacement key.
 //
 // Authorization to open/sign an existing key is governed by the persisted DACL
-// and is not equivalent to permission to create/delete (which requires
-// Administrator elevation). To open a key you already created, run from an
-// elevated PowerShell:
+// and is not equivalent to permission to create/delete. Those operations need
+// a Windows context authorized by the KSP. An elevated PowerShell is one way
+// to open a key you already created:
 //
 //	go run ./examples/openexisting -name "Example.CNG.Disposable.SignVerify.v1"
 //
@@ -26,6 +26,12 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	name := flag.String("name", "Example.CNG.Disposable.SignVerify.v1",
 		"exact machine-scoped CNG key name to open (never created if absent)")
 	flag.Parse()
@@ -33,17 +39,18 @@ func main() {
 	signer, err := windowscng.Open(*name)
 	if err != nil {
 		if errors.Is(err, windowscng.ErrKeyNotFound) {
-			log.Fatalf("key %q does not exist: Open never creates a replacement (%v)", *name, err)
+			return fmt.Errorf("key %q does not exist: Open never creates a replacement (%w)", *name, err)
 		}
-		log.Fatalf("Open: %v", err)
+		return fmt.Errorf("Open: %w", err)
 	}
 	// Register cleanup immediately after successful acquisition.
 	defer signer.Close()
 
 	pub, ok := signer.Public().(*ecdsa.PublicKey)
 	if !ok {
-		log.Fatalf("Public() = %T, want *ecdsa.PublicKey", signer.Public())
+		return fmt.Errorf("Public() = %T, want *ecdsa.PublicKey", signer.Public())
 	}
 
 	fmt.Printf("opened existing key %q (public key present: %v)\n", *name, pub != nil)
+	return nil
 }
