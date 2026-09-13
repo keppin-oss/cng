@@ -5,8 +5,8 @@
 // cleanup immediately, sign through crypto.Signer, and verify using public
 // material only. The private key is never exported or materialized.
 //
-// LoadOrCreate may create a machine-scoped CNG key, which requires an
-// Administrator-elevated process. Run from an elevated PowerShell:
+// LoadOrCreate may create a machine-scoped CNG key and needs a Windows context
+// authorized for that operation. An elevated PowerShell is one way to run it:
 //
 //	go run ./examples/signverify
 package main
@@ -26,10 +26,16 @@ import (
 const exampleKeyName = "Example.CNG.Disposable.SignVerify.v1"
 
 func main() {
-	// Requires Administrator elevation: this may create a machine-scoped key.
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	// The process must be authorized if a machine-scoped key is created.
 	signer, err := windowscng.LoadOrCreate(exampleKeyName)
 	if err != nil {
-		log.Fatalf("LoadOrCreate: %v", err)
+		return fmt.Errorf("LoadOrCreate: %w", err)
 	}
 	// Register cleanup immediately, before any later fallible operation.
 	// Close releases handles but does not delete the persisted key.
@@ -38,18 +44,19 @@ func main() {
 	// Public material only; the private key stays inside CNG.
 	pub, ok := signer.Public().(*ecdsa.PublicKey)
 	if !ok {
-		log.Fatalf("Public() = %T, want *ecdsa.PublicKey", signer.Public())
+		return fmt.Errorf("Public() = %T, want *ecdsa.PublicKey", signer.Public())
 	}
 
 	digest := sha256.Sum256([]byte("keppin-oss-cng-signverify"))
 	sig, err := signer.Sign(rand.Reader, digest[:], nil)
 	if err != nil {
-		log.Fatalf("sign: %v", err)
+		return fmt.Errorf("sign: %w", err)
 	}
 
 	if !ecdsa.VerifyASN1(pub, digest[:], sig) {
-		log.Fatal("signature did not verify")
+		return fmt.Errorf("signature did not verify")
 	}
 
 	fmt.Println("sign/verify succeeded using public material only")
+	return nil
 }

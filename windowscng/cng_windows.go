@@ -19,7 +19,7 @@ import (
 const (
 	ncryptMachineKeyFlag   = 0x00000020
 	ncryptSilentFlag       = 0x00000040
-	ncryptAllowSigningFlag = 0x00000001
+	ncryptAllowSigningFlag = 0x00000002
 
 	// NCRYPT_EXPORT_POLICY_PROPERTY values.
 	ncryptAllowExportFlag             = 0x00000001
@@ -48,11 +48,15 @@ const daclSecurityInformation = 0x00000004
 //
 // The Microsoft Software KSP may canonicalize the persisted generic mask. In
 // manual Windows proof, the LOCAL SERVICE ACE persisted as GENERIC_READ only.
-// Static DACL verification therefore proves the principal boundary and rejects
-// administrative/write access; actual signing capability is proved behaviorally
-// by running NCryptOpenKey + NCryptSignHash as LOCAL SERVICE.
+// Provisioning requests this restrictive DACL policy. Validation checks the
+// required principals and rejects specific disallowed principals, but it does
+// not establish an exclusive allow-list or fully evaluate owner, inheritance,
+// every additional ACE, or Windows effective access. LOCAL SERVICE is a shared
+// Windows service identity; this policy does not by itself isolate one LOCAL
+// SERVICE process from another.
 //
-// No access for ordinary interactive users (no WD, AU, IU, BU ACE).
+// The SDDL string requests no allow ACE for ordinary interactive users (no WD,
+// AU, IU, BU ACE).
 const keySecuritySDDL = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;LS)"
 
 // Generic access rights masks — used for structural ACL verification.
@@ -162,16 +166,23 @@ func IsKeyNotFound(r uintptr) bool {
 // Open opens the existing persisted machine-scoped key named name without
 // creating a replacement. It returns ErrKeyNotFound when the key does not exist
 // and an error when the key exists but is inaccessible or fails security
-// validation.
+// validation. Successful Open means the key passed the validation implemented
+// by this module; it is not a certification of the key's complete Windows
+// effective-access policy.
 func Open(name string) (Signer, error) {
 	return openKey(name)
 }
 
-// LoadOrCreate opens the existing persisted machine-scoped key named name, or
-// creates it as a non-exportable, machine-scoped ECDSA P-256 signing key in the
-// Microsoft Software Key Storage Provider if it does not yet exist.
-//
-// It never silently replaces an existing incompatible or inaccessible key.
+// LoadOrCreate first attempts to open the existing persisted machine-scoped key
+// named name. After a successful native open, it returns a signer only if key
+// validation and public-key loading also succeed. The key must be non-exportable,
+// machine-scoped ECDSA P-256 in the Microsoft Software Key Storage Provider.
+// In v0.1.1, if the native open operation fails, it attempts creation
+// without first classifying every possible open failure as "not found". Callers
+// that need to distinguish an absent key from an inaccessible or otherwise
+// failing key should not treat LoadOrCreate as proof that the key was absent. If
+// the subsequent creation attempt also fails, the returned error can describe
+// that creation failure rather than the original open failure.
 func LoadOrCreate(name string) (Signer, error) {
 	return loadOrCreateKey(name)
 }
@@ -259,9 +270,11 @@ func aceSid(ace *accessAllowedAce) unsafe.Pointer {
 	return unsafe.Pointer(uintptr(unsafe.Pointer(ace)) + unsafe.Offsetof(ace.Mask) + unsafe.Sizeof(ace.Mask))
 }
 
-// verifyDACL proves the persisted principal boundary structurally. It does not
-// infer LOCAL SERVICE signing capability from a particular serialized generic
-// execute bit; that capability is verified by the LocalService behavioral test.
+// verifyDACL checks the required principals and rejects specific disallowed
+// principals in the persisted DACL. It does not establish an exclusive
+// allow-list or fully evaluate owner, inheritance, every additional ACE, or
+// Windows effective access. It does not infer LOCAL SERVICE signing capability
+// from a particular serialized generic execute bit.
 func verifyDACL(keyHandle uintptr) error {
 	var propLen uint32
 	r, _, _ := procNCryptGetProperty.Call(
@@ -438,8 +451,9 @@ func verifyDACL(keyHandle uintptr) error {
 			}
 			foundLS = true
 			// The Software KSP canonicalized the requested GR|GX ACE to GR in
-			// the real Windows proof. Require read/open capability, and reject
-			// administrative/write capability. Signing is proved behaviorally.
+			// the real Windows proof. Require GENERIC_READ and reject
+			// GENERIC_WRITE and GENERIC_ALL. Other access-mask bits are not
+			// checked here; effective open or signing access is not established.
 			if generic&genericRead == 0 {
 				return fmt.Errorf("LOCAL SERVICE ACE generic mask 0x%08X lacks GENERIC_READ", generic)
 			}

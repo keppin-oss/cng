@@ -109,6 +109,9 @@ Opens the existing persisted machine-scoped key identified by the exact name.
 validates the persisted key's export policy and access-control configuration and
 loads its ECDSA P-256 public key.
 
+Successful `Open` means the key passed the validation implemented by this module;
+it is not a certification of the key's complete Windows effective-access policy.
+
 If the native open operation reports that the key does not exist, the returned
 error wraps `ErrKeyNotFound`.
 
@@ -119,6 +122,14 @@ Use `Open` when the application expects provisioning to have already occurred.
 Attempts to acquire the exact named persisted key. When creation is required,
 the package requests a machine-scoped ECDSA P-256 key from the Microsoft
 Software Key Storage Provider and configures the package's security settings.
+
+`LoadOrCreate` first attempts to open the named key. In v0.1.1, if the native
+open operation fails, it attempts creation without first classifying every
+possible open failure as "not found". Callers that need to distinguish an absent
+key from an inaccessible or otherwise failing key should not treat `LoadOrCreate`
+as proof that the key was absent. If the subsequent creation attempt also fails,
+the returned error can describe that creation failure rather than the original
+open failure.
 
 Existing keys are validated before a signer is returned.
 
@@ -209,6 +220,11 @@ is expected to consume the existing key.
 Actual access remains subject to Windows and Microsoft Software KSP
 authorization.
 
+Provisioning and cleanup are not transactional. An error does not guarantee that
+no persistent key state was created, and a best-effort cleanup attempt can itself
+fail. Callers that require recovery or reconciliation must account for possible
+persistent state after an error.
+
 ## Lifecycle and Concurrency
 
 Persisted-key lifetime and signer lifetime are independent.
@@ -217,6 +233,10 @@ Call `Close` when a signer is no longer needed. Use `Delete` only when the
 application intentionally wants to remove the exact persisted key that it owns.
 
 Do not use deletion as a substitute for closing signer handles.
+
+The caller must ensure that `Close` does not run concurrently with `Sign` or
+with another `Close` on the same signer. After `Close`, the signer must not be
+reused.
 
 The package does not provide provisioning coordination or multi-process
 lifecycle management. Applications should coordinate provisioning and deletion

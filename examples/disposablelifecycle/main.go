@@ -7,8 +7,8 @@
 // invocation. It never accepts or deletes an arbitrary production key name and
 // performs no wildcard/prefix deletion.
 //
-// Machine-scoped key creation and deletion require an Administrator-elevated
-// process. Run from an elevated PowerShell:
+// Machine-scoped key creation and deletion need a Windows context authorized
+// for those operations. An elevated PowerShell is one way to run this example:
 //
 //	go run ./examples/disposablelifecycle
 package main
@@ -25,14 +25,20 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	// A name unique to this invocation. The example owns this name and deletes
 	// only this name.
 	name := fmt.Sprintf("Example.CNG.Disposable.%d", time.Now().UnixNano())
 
-	// Requires Administrator elevation: this creates a machine-scoped key.
+	// The process must be authorized if a machine-scoped key is created.
 	signer, err := windowscng.LoadOrCreate(name)
 	if err != nil {
-		log.Fatalf("LoadOrCreate: %v", err)
+		return fmt.Errorf("LoadOrCreate: %w", err)
 	}
 	// Immediate cleanup registration. Close is idempotent and releases handles
 	// but does not delete the persisted key; the explicit Close below is the
@@ -41,27 +47,28 @@ func main() {
 
 	pub, ok := signer.Public().(*ecdsa.PublicKey)
 	if !ok {
-		log.Fatalf("Public() = %T, want *ecdsa.PublicKey", signer.Public())
+		return fmt.Errorf("Public() = %T, want *ecdsa.PublicKey", signer.Public())
 	}
 
 	digest := sha256.Sum256([]byte("keppin-oss-cng-disposable-lifecycle"))
 	sig, err := signer.Sign(rand.Reader, digest[:], nil)
 	if err != nil {
-		log.Fatalf("sign: %v", err)
+		return fmt.Errorf("sign: %w", err)
 	}
 	if !ecdsa.VerifyASN1(pub, digest[:], sig) {
-		log.Fatal("signature did not verify")
+		return fmt.Errorf("signature did not verify")
 	}
 
 	// Close the signer before the destructive delete, as the ownership
 	// contract requires.
 	if err := signer.Close(); err != nil {
-		log.Fatalf("close: %v", err)
+		return fmt.Errorf("close: %w", err)
 	}
 
 	if err := windowscng.Delete(name); err != nil {
-		log.Fatalf("delete %q: %v", name, err)
+		return fmt.Errorf("delete %q: %w", name, err)
 	}
 
 	fmt.Printf("created, signed, verified, closed, and deleted %q\n", name)
+	return nil
 }

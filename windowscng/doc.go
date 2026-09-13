@@ -13,8 +13,11 @@
 //     returned through a crypto.Signer;
 //   - delete an exact machine-scoped key with correct NCryptDeleteKey handle
 //     ownership;
-//   - enforce the shared least-privilege DACL (SYSTEM, Administrators, and
-//     LOCAL SERVICE only).
+//   - request a restrictive machine-key DACL at provisioning and validate that
+//     the required principals (SYSTEM, Administrators, and LOCAL SERVICE) are
+//     present while rejecting specific disallowed principals; validation does
+//     not establish an exclusive allow-list or fully evaluate owner,
+//     inheritance, every additional ACE, or Windows effective access.
 //
 // The package is Windows-only. It does not implement X.509, certificate-store,
 // enrollment, trust-store, or orchestration behavior.

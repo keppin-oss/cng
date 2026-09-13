@@ -19,7 +19,7 @@ func TestCNGFlagConstants(t *testing.T) {
 	}{
 		{"ncryptMachineKeyFlag", ncryptMachineKeyFlag, 0x00000020},
 		{"ncryptSilentFlag", ncryptSilentFlag, 0x00000040},
-		{"ncryptAllowSigningFlag", ncryptAllowSigningFlag, 0x00000001},
+		{"ncryptAllowSigningFlag", ncryptAllowSigningFlag, 0x00000002},
 		{"ncryptAllowExportFlag", ncryptAllowExportFlag, 0x00000001},
 		{"ncryptAllowPlaintextExportFlag", ncryptAllowPlaintextExportFlag, 0x00000002},
 		{"ncryptAllowArchivingFlag", ncryptAllowArchivingFlag, 0x00000004},
@@ -95,8 +95,9 @@ func TestGenericAllIsOwnBit(t *testing.T) {
 }
 
 func TestLocalServiceStaticMaskSemantics(t *testing.T) {
-	// The static verifier proves the principal boundary. It must not infer
-	// signing capability from a serialized GENERIC_EXECUTE bit because the
+	// This test checks a local generic-mask predicate, not the full DACL
+	// verifier or effective access. It does not infer signing capability from
+	// a serialized GENERIC_EXECUTE bit because the
 	// Microsoft Software KSP canonicalized the real persisted LS ACE to GR.
 	lsStaticValid := func(mask uint32) bool {
 		generic := mask & genericRights
@@ -110,13 +111,13 @@ func TestLocalServiceStaticMaskSemantics(t *testing.T) {
 		t.Error("GR|GX must also pass static boundary validation")
 	}
 	if lsStaticValid(0xC0000000) {
-		t.Error("GR|GW must fail: write access is forbidden")
+		t.Error("GR|GW must fail: GENERIC_WRITE is rejected")
 	}
 	if lsStaticValid(0x90000000) {
-		t.Error("GR|GA must fail: administrative access is forbidden")
+		t.Error("GR|GA must fail: GENERIC_ALL is rejected")
 	}
 	if lsStaticValid(0x20000000) {
-		t.Error("GX-only must fail: read/open capability is required")
+		t.Error("GX-only must fail: GENERIC_READ is required")
 	}
 }
 
