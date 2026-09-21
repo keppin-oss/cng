@@ -9,7 +9,7 @@ This document contains the technical documentation for
 - **Provider:** Microsoft Software Key Storage Provider.
 - **Algorithm:** ECDSA P-256.
 - **Key scope:** persisted keys use Windows machine scope.
-- **Go:** 1.26.5, as declared by the module.
+- **Go:** 1.26.8, as declared by the module.
 
 The package includes non-Windows stubs for the core operations, but CNG key
 operations themselves are Windows-specific.
