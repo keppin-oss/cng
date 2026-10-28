@@ -11,8 +11,11 @@
 //
 //	go run ./examples/openexisting -name "Example.CNG.Disposable.SignVerify.v1"
 //
-// If the key does not exist, the program reports ErrKeyNotFound and exits
-// without creating a replacement.
+// If the native open reports the key as not found or not accessible
+// (ErrKeyNotFound: NTE_NOT_FOUND or the ambiguous NTE_BAD_KEYSET, which the
+// KSP also returns to a caller the key's DACL does not grant), the program
+// reports it with the native HRESULT and exits without creating a replacement.
+// It does not conclude that the key is absent.
 package main
 
 import (
@@ -39,7 +42,7 @@ func run() error {
 	signer, err := windowscng.Open(*name)
 	if err != nil {
 		if errors.Is(err, windowscng.ErrKeyNotFound) {
-			return fmt.Errorf("key %q does not exist: Open never creates a replacement (%w)", *name, err)
+			return fmt.Errorf("key %q was not found or is not accessible to this caller; Open never creates a replacement (%w)", *name, err)
 		}
 		return fmt.Errorf("Open: %w", err)
 	}

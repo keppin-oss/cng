@@ -17,7 +17,16 @@
 //     the required principals (SYSTEM, Administrators, and LOCAL SERVICE) are
 //     present while rejecting specific disallowed principals; validation does
 //     not establish an exclusive allow-list or fully evaluate owner,
-//     inheritance, every additional ACE, or Windows effective access.
+//     inheritance, every additional ACE, or Windows effective access;
+//   - with the additive policy API (OpenWithPolicy, LoadOrCreateWithPolicy,
+//     ApplyPolicy), select a per-key DACL policy, PolicyServiceSigner or
+//     PolicyPrivilegedOnly, verify the persisted DACL against an exact-match
+//     allow-list, and tighten an existing service-signer key to privileged-only
+//     in place. The legacy functions are unchanged;
+//   - with ServicePolicy (OpenForService, LoadOrCreateForService,
+//     ApplyServicePolicy), provision and verify a key whose DACL grants one
+//     Windows service's own SID instead of LOCAL SERVICE as a whole, and
+//     migrate a service-signer key to it in place.
 //
 // The package is Windows-only. It does not implement X.509, certificate-store,
 // enrollment, trust-store, or orchestration behavior.
