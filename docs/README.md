@@ -1,263 +1,154 @@
-# Keppin-OSS CNG Documentation
+# Keppin CNG
 
-This document contains the technical documentation for
-[`github.com/keppin-oss/cng`](https://github.com/keppin-oss/cng).
+Keppin CNG is a small Go module that keeps signing keys inside Windows. It lets
+a Go application create, open and use a **machine-scoped ECDSA P-256 key** held
+by the Microsoft Software Key Storage Provider (KSP), and sign through the
+standard `crypto.Signer` interface. The private key is never exported: your
+code only ever sees the public key and the signatures.
+
+The module is deliberately low-level. It does not issue certificates, manage
+trust stores or decide who your application is; you choose the key names and
+own the key lifecycle.
+
+## When to use it
+
+Use it when a Windows service or tool needs a signing key that
+
+- survives restarts and is shared by processes on the machine;
+- cannot be copied out of the machine as a file;
+- is usable only by the accounts you intend (SYSTEM, Administrators, and
+  optionally LOCAL SERVICE or one specific Windows service).
+
+## Features
+
+- **Windows CNG keys** — `Open`, `LoadOrCreate` and `Delete` act on an exact,
+  caller-supplied key name. There is no enumeration, no wildcard deletion and
+  no private-key export.
+- **Signing** — keys are returned as a `Signer`, a `crypto.Signer` with a
+  `Close` method. Signatures are ASN.1 DER ECDSA over a digest you compute.
+- **Access policies (ACL)** — each key carries a protected DACL, chosen when
+  the key is created and verified exactly each time it is opened:
+
+  | Policy | Who can use the key |
+  |---|---|
+  | `PolicyServiceSigner` | SYSTEM, Administrators, and LOCAL SERVICE (read/execute) |
+  | `PolicyPrivilegedOnly` | SYSTEM and Administrators only |
+  | `ServicePolicy` | SYSTEM, Administrators, and **one** Windows service |
+
+  Functions: `OpenWithPolicy`, `LoadOrCreateWithPolicy`, `ApplyPolicy`.
+- **Per-service keys (service SID)** — `NewServicePolicy("MyService")` grants
+  the key to that service's own SID (`NT SERVICE\MyService`) instead of to
+  every LOCAL SERVICE process. Functions: `OpenForService`,
+  `LoadOrCreateForService`, `ApplyServicePolicy`, `ServiceSID`.
+- **Tighten-only changes** — `ApplyPolicy` and `ApplyServicePolicy` rewrite the
+  DACL of an existing key in place, only toward less access (for example
+  service-signer to privileged-only, or LOCAL SERVICE to one service). They
+  never widen access and never recreate or delete the key.
 
 ## Requirements
 
-- **Operating system:** Windows for CNG operations.
-- **Provider:** Microsoft Software Key Storage Provider.
-- **Algorithm:** ECDSA P-256.
-- **Key scope:** persisted keys use Windows machine scope.
-- **Go:** 1.26.8, as declared by the module.
+- Windows, with the Microsoft Software Key Storage Provider.
+- Go 1.26.8 or later (`go.mod`). On other operating systems the package
+  compiles, but its constructors return an error.
+- No third-party dependencies.
+- Creating, deleting or re-protecting a machine key needs a privileged context
+  (SYSTEM or an elevated Administrator); the package never elevates or
+  impersonates. Opening an existing key needs only the access its DACL grants.
 
-The package includes non-Windows stubs for the core operations, but CNG key
-operations themselves are Windows-specific.
+## Example
 
-## Installation
-
-```text
-go get github.com/keppin-oss/cng
-```
-
-```go
-import "github.com/keppin-oss/cng/windowscng"
-```
-
-## Quick Start
-
-The following example acquires a persisted signer, signs a SHA-256 digest, and
-verifies the signature using the public key.
-
-If the named key needs to be provisioned, run the example from an appropriately
-authorized Windows context.
+Provision a key for one service from a privileged context, then sign with it.
+Inside the service itself, call `OpenForService` instead of
+`LoadOrCreateForService`.
 
 ```go
 package main
 
 import (
-    "crypto/ecdsa"
-    "crypto/rand"
-    "crypto/sha256"
-    "fmt"
-    "log"
+	"crypto/ecdsa"
+	"crypto/rand"
+	"crypto/sha256"
+	"log"
 
-    "github.com/keppin-oss/cng/windowscng"
+	"github.com/keppin-oss/cng/windowscng"
 )
 
 func main() {
-    if err := run(); err != nil {
-        log.Fatal(err)
-    }
-}
+	policy, err := windowscng.NewServicePolicy("ExampleAgent")
+	if err != nil {
+		log.Fatal(err)
+	}
 
-func run() error {
-    const name = "Example.CNG.QuickStart.Disposable.v1"
+	// Opens the key, or creates it if absent (privileged callers only).
+	signer, err := windowscng.LoadOrCreateForService("Example.Agent.Key.v1", policy)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer signer.Close() // releases handles; the persisted key stays
 
-    signer, err := windowscng.LoadOrCreate(name)
-    if err != nil {
-        return fmt.Errorf("load or create key: %w", err)
-    }
-    defer signer.Close()
+	digest := sha256.Sum256([]byte("message"))
+	sig, err := signer.Sign(rand.Reader, digest[:], nil)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-    pub, ok := signer.Public().(*ecdsa.PublicKey)
-    if !ok {
-        return fmt.Errorf("unexpected public key type %T", signer.Public())
-    }
-
-    digest := sha256.Sum256([]byte("hello keppin-oss-cng"))
-    signature, err := signer.Sign(rand.Reader, digest[:], nil)
-    if err != nil {
-        return fmt.Errorf("sign: %w", err)
-    }
-
-    if !ecdsa.VerifyASN1(pub, digest[:], signature) {
-        return fmt.Errorf("signature did not verify")
-    }
-
-    return nil
+	pub := signer.Public().(*ecdsa.PublicKey)
+	log.Println("verified:", ecdsa.VerifyASN1(pub, digest[:], sig))
 }
 ```
 
-`Close` releases signer resources. It does not delete the persisted key.
+For a key shared by LOCAL SERVICE processes, use `windowscng.LoadOrCreate(name)`
+and `windowscng.Open(name)`. Runnable examples are in [`examples/`](../examples/).
 
-Only delete an exact key name that your application owns.
+## Security model
 
-## Public API
+- Keys are created in machine scope, non-exportable, in the Microsoft Software
+  KSP. Only public-key material leaves the package.
+- The requested DACL is set **before** the key is finalized, then read back. A
+  signer is returned only if the persisted DACL passes validation; otherwise
+  the call fails and tries to delete the key it just created.
+- The policy functions accept a key only if its DACL matches the requested
+  policy **exactly** (protected, explicit allow entries, known principals and
+  masks). Anything else returns `ErrPolicyMismatch`.
+- `ncrypt.dll` and `advapi32.dll` are loaded only from the Windows system
+  directory; key operations fail if a different module of the same name is
+  already loaded.
+- Existing keys are never deleted, overwritten or regenerated by a failed call.
 
-On Windows, the package exposes:
+## Errors
 
-```go
-type Signer interface {
-    crypto.Signer
-    Close() error
-}
-
-func Open(name string) (Signer, error)
-func LoadOrCreate(name string) (Signer, error)
-func Delete(name string) error
-
-var ErrKeyNotFound error
-func IsKeyNotFound(r uintptr) bool
-```
-
-### `Open(name)`
-
-Opens the existing persisted machine-scoped key identified by the exact name.
-
-`Open` does not create a key. Before returning a signer, the implementation
-validates the persisted key's export policy and access-control configuration and
-loads its ECDSA P-256 public key.
-
-Successful `Open` means the key passed the validation implemented by this module;
-it is not a certification of the key's complete Windows effective-access policy.
-
-If the native open operation reports that the key does not exist, the returned
-error wraps `ErrKeyNotFound`.
-
-Use `Open` when the application expects provisioning to have already occurred.
-
-### `LoadOrCreate(name)`
-
-Attempts to acquire the exact named persisted key. When creation is required,
-the package requests a machine-scoped ECDSA P-256 key from the Microsoft
-Software Key Storage Provider and configures the package's security settings.
-
-`LoadOrCreate` first attempts to open the named key. In v0.1.1, if the native
-open operation fails, it attempts creation without first classifying every
-possible open failure as "not found". Callers that need to distinguish an absent
-key from an inaccessible or otherwise failing key should not treat `LoadOrCreate`
-as proof that the key was absent. If the subsequent creation attempt also fails,
-the returned error can describe that creation failure rather than the original
-open failure.
-
-Existing keys are validated before a signer is returned.
-
-Applications that require a strict separation between provisioning and runtime
-key use should provision separately and use `Open` at runtime.
-
-### `Delete(name)`
-
-Deletes the exact named persisted machine-scoped key.
-
-`Delete` does not enumerate keys and does not perform wildcard or prefix-based
-deletion.
-
-If the native open operation reports that the key is already absent, the
-returned error wraps `ErrKeyNotFound`.
-
-### `Signer`
-
-`Public` returns the ECDSA public key associated with the signer without
-exporting private-key material.
-
-`Sign` signs the supplied digest through Windows CNG and returns an ASN.1
-DER-encoded ECDSA signature suitable for `ecdsa.VerifyASN1`. Pass a digest
-rather than an unhashed message.
-
-`Close` releases resources associated with the signer. It does not delete the
-persisted key.
-
-### `ErrKeyNotFound`
-
-Use Go's standard error matching to recognize an absent persisted key:
-
-```go
-if errors.Is(err, windowscng.ErrKeyNotFound) {
-    // key is absent
-}
-```
-
-`IsKeyNotFound` is available when classification of a raw native status is
-required.
-
-## Security Model
-
-### Machine-scoped, non-exportable keys
-
-New persisted keys are requested in Windows machine scope using the Microsoft
-Software Key Storage Provider.
-
-The package configures the key export policy to disallow the private-key export
-and archiving modes checked by the implementation. Existing keys are validated
-before being exposed through a signer.
-
-The package exports only public-key material.
-
-### Key access control
-
-For newly created keys, the package requests the following protected DACL:
-
-```text
-D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;LS)
-```
-
-| Principal | Requested access |
+| Error | Meaning |
 |---|---|
-| SYSTEM | `GENERIC_ALL` |
-| Built-in Administrators | `GENERIC_ALL` |
-| LOCAL SERVICE | `GENERIC_READ | GENERIC_EXECUTE` |
+| `ErrKeyNotFound` | Key not found **or** not accessible to the caller. |
+| `ErrPolicyMismatch` | The key's DACL is not the requested policy, or the change would widen access. |
+| `ErrPrivilegeRequired` | The operation needs SYSTEM or an elevated Administrator. |
+| `ErrCleanupFailed` | A failed call created a key and could not delete it; inspect it. |
 
-The package validates relevant properties of the persisted DACL before exposing
-a signer. This is a structural security check and should not be interpreted as
-a complete Windows effective-access calculation.
+## Limits to be aware of
 
-### Provisioning and runtime use
+- **"Not found" is ambiguous.** For a caller the DACL does not grant, the KSP
+  reports the same status as for a missing key. Never treat `ErrKeyNotFound`
+  as proof of absence, and never regenerate an identity key because of it.
+- **Static check only.** DACL validation inspects the descriptor; it is not a
+  computation of Windows effective access (owner rights, privileges, SACL).
+- **Not transactional.** After an error a new key may still exist. If a key was
+  created and validated but building the signer then failed, it stays
+  persisted.
+- **Open handles are not revoked.** After `ApplyPolicy` or
+  `ApplyServicePolicy`, processes that already opened the key keep working;
+  restart or reopen consumers.
+- **Service SID.** A service key works only if the service has its SID enabled,
+  for example `sc.exe sidtype <service> unrestricted`.
+- **Verified scope.** Per-service isolation was verified natively on one setup:
+  Windows NT 10.0.26200, Microsoft Software KSP, services running as LOCAL
+  SERVICE with an unrestricted service SID, keys created by
+  `LoadOrCreateForService`. Other KSPs, Windows builds, restricted SIDs and
+  keys migrated with `ApplyServicePolicy` are not covered.
+- **Lifecycle.** Call `Close` when done and do not run it concurrently with
+  `Sign` on the same signer. Coordinate provisioning and deletion outside this
+  module; use `Delete` only for keys your application owns.
 
-Key provisioning and key use are separate concerns.
-
-Creating or deleting a machine-scoped persisted key must run in a Windows
-security context authorized to perform the requested operation. The package
-does not elevate or impersonate another identity.
-
-Access granted to an existing key does not by itself establish permission to
-create new machine-scoped keys.
-
-For applications with a separate provisioning phase, provision the key from an
-appropriately authorized context and use `Open` from the runtime process that
-is expected to consume the existing key.
-
-Actual access remains subject to Windows and Microsoft Software KSP
-authorization.
-
-Provisioning and cleanup are not transactional. An error does not guarantee that
-no persistent key state was created, and a best-effort cleanup attempt can itself
-fail. Callers that require recovery or reconciliation must account for possible
-persistent state after an error.
-
-## Lifecycle and Concurrency
-
-Persisted-key lifetime and signer lifetime are independent.
-
-Call `Close` when a signer is no longer needed. Use `Delete` only when the
-application intentionally wants to remove the exact persisted key that it owns.
-
-Do not use deletion as a substitute for closing signer handles.
-
-The caller must ensure that `Close` does not run concurrently with `Sign` or
-with another `Close` on the same signer. After `Close`, the signer must not be
-reused.
-
-The package does not provide provisioning coordination or multi-process
-lifecycle management. Applications should coordinate provisioning and deletion
-outside this module.
-
-## Examples
-
-Windows examples are included under `examples/`:
-
-| Example | Purpose |
-|---|---|
-| `signverify` | Acquire a signer, sign a digest, and verify with public material. |
-| `openexisting` | Open an existing key and handle an absent key without provisioning it. |
-| `disposablelifecycle` | Exercise creation, signing, closing, and deletion with an example-owned key. |
-
-Read the example source before running operations that may create or delete a
-persisted machine key.
-
-## Validation and Testing
-
-Run the standard checks on Windows:
+## Building and testing
 
 ```text
 go build ./...
@@ -265,27 +156,9 @@ go vet ./...
 go test ./...
 ```
 
-A Windows lifecycle smoke test is also available:
-
-```text
-go test -tags cng_smoke ./windowscng -run TestSmokeKeyLifecycle -v
-```
-
-The smoke test operates on a persisted machine key and should be run from an
-appropriately authorized Windows context.
-
-It uses the exact test key name:
-
-```text
-Keppin.OSS.Test.CNG.Lifecycle.v1
-```
-
-Reserve that name for testing.
-
-The test suite validates implementation behavior covered by the repository. It
-should not be interpreted as proof of authorization behavior for every Windows
-execution identity or environment.
+The default tests use an in-memory key store and do not create, modify or
+delete any persisted key.
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+Licensed under the Apache License, Version 2.0. See [LICENSE](../LICENSE).

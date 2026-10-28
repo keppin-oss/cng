@@ -21,7 +21,9 @@ Use this module when an application needs:
 - private-key custody through the Microsoft Software Key Storage Provider;
 - signing through the Go `crypto.Signer` interface;
 - operations on exact, caller-supplied key names;
-- validation of key export policy and key access-control configuration.
+- validation of key export policy and key access-control configuration;
+- optional per-key access policies (service signer or privileged-only) with
+  strict DACL verification and an explicit, tighten-only policy change.
 
 The caller owns key naming, application identity, provisioning orchestration,
 certificate lifecycle, and the decision to delete a persisted key.
@@ -32,6 +34,6 @@ enumeration, wildcard deletion, private-key export, or a PEM fallback.
 
 ## Resources
 
-- [Documentation](docs/README.md) — Complete API reference, security model, lifecycle guidance, and validation instructions.
+- [Documentation](docs/README.md) — Product overview, features, requirements, a Go example, the security model, and operational limits.
 - [Examples](examples/) — Runnable examples showing the main package workflows.
 - [Package source](windowscng/) — Source code and tests for the `windowscng` package.
