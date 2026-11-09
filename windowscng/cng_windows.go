@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -783,12 +784,74 @@ func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintp
 	return keyHandle, nil
 }
 
+// errSignerClosed is returned by Sign on a closed signer: always once Close
+// has returned, and for a Sign that the signer's lock orders after Close.
+var errSignerClosed = errors.New("signer is closed")
+
+// signerNative is the set of native operations a cngSigner performs on its
+// handles. Production code uses nativeSignerOps; tests inject a simulated
+// backend to drive Sign/Close interleavings deterministically.
+type signerNative interface {
+	// signHashSize runs NCryptSignHash without an output buffer to obtain
+	// the signature size.
+	signHashSize(key uintptr, digest []byte, size *uint32) (hr uintptr, callErr error)
+	// signHash runs NCryptSignHash into sig. sig is never empty.
+	signHash(key uintptr, digest, sig []byte, size *uint32) (hr uintptr, callErr error)
+	// freeObject runs NCryptFreeObject on a provider or key handle.
+	freeObject(h uintptr) (hr uintptr)
+}
+
+// nativeSignerOps calls ncrypt.dll. Each Go pointer is converted to uintptr
+// inside the Call argument list, as the go:uintptrescapes contract of
+// systemProc.Call requires.
+type nativeSignerOps struct{}
+
+func (nativeSignerOps) signHashSize(key uintptr, digest []byte, size *uint32) (uintptr, error) {
+	r, _, err := procNCryptSignHash.Call(
+		key, 0,
+		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
+		0, 0,
+		uintptr(unsafe.Pointer(size)),
+		uintptr(ncryptSilentFlag),
+	)
+	return r, err
+}
+
+func (nativeSignerOps) signHash(key uintptr, digest, sig []byte, size *uint32) (uintptr, error) {
+	r, _, err := procNCryptSignHash.Call(
+		key, 0,
+		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
+		uintptr(unsafe.Pointer(&sig[0])), uintptr(len(sig)),
+		uintptr(unsafe.Pointer(size)),
+		uintptr(ncryptSilentFlag),
+	)
+	return r, err
+}
+
+func (nativeSignerOps) freeObject(h uintptr) uintptr {
+	r, _, _ := procNCryptFreeObject.Call(h)
+	return r
+}
+
 // cngSigner implements Signer backed by a CNG persisted key.
+//
+// Concurrency (D3): mu guards the handles and the closed flag. Sign holds a
+// read lock for its whole use of the key handle (state check and both
+// NCryptSignHash calls), so concurrent Sign calls proceed in parallel. Close
+// takes the write lock: it waits for every Sign already holding the read lock,
+// and while it waits sync.RWMutex admits no new readers. It then marks the
+// signer closed and makes at most one free attempt per handle. The lock orders
+// overlapping calls: a Sign that acquires it before Close runs normally, a
+// Sign that acquires it after Close fails with errSignerClosed without calling
+// CNG, and every Sign fails that way once Close has returned.
 type cngSigner struct {
+	mu        sync.RWMutex
+	closed    bool
 	provider  uintptr
 	key       uintptr
 	name      string
 	publicKey crypto.PublicKey
+	native    signerNative // nil means nativeSignerOps
 }
 
 func newCNGSigner(provider, key uintptr, name string) (*cngSigner, error) {
@@ -799,52 +862,81 @@ func newCNGSigner(provider, key uintptr, name string) (*cngSigner, error) {
 	return &cngSigner{provider: provider, key: key, name: name, publicKey: pub}, nil
 }
 
+func (s *cngSigner) ops() signerNative {
+	if s.native != nil {
+		return s.native
+	}
+	return nativeSignerOps{}
+}
+
+// Public returns the public key exported when the signer was built. It needs
+// no handle and stays valid after Close.
 func (s *cngSigner) Public() crypto.PublicKey { return s.publicKey }
 
+// Sign signs digest with the CNG key. It is safe to call concurrently with
+// other Sign calls and with Close on the same signer; see cngSigner for how
+// overlapping calls are ordered.
 func (s *cngSigner) Sign(_ io.Reader, digest []byte, _ crypto.SignerOpts) ([]byte, error) {
-	if s.key == 0 {
-		return nil, fmt.Errorf("signer is closed")
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.closed || s.key == 0 {
+		return nil, errSignerClosed
 	}
 	if len(digest) == 0 {
 		return nil, fmt.Errorf("digest is empty")
 	}
+	native := s.ops()
 
 	var sigSize uint32
-	r, _, err := procNCryptSignHash.Call(
-		s.key, 0,
-		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
-		0, 0,
-		uintptr(unsafe.Pointer(&sigSize)),
-		uintptr(ncryptSilentFlag),
-	)
-	if r != 0 {
+	if r, err := native.signHashSize(s.key, digest, &sigSize); r != 0 {
 		return nil, fmt.Errorf("NCryptSignHash (query size): hr=0x%x %v", r, err)
+	}
+	if sigSize == 0 {
+		return nil, fmt.Errorf("NCryptSignHash (query size): reported size 0")
 	}
 
 	sigBuf := make([]byte, sigSize)
-	r, _, err = procNCryptSignHash.Call(
-		s.key, 0,
-		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
-		uintptr(unsafe.Pointer(&sigBuf[0])), uintptr(sigSize),
-		uintptr(unsafe.Pointer(&sigSize)),
-		uintptr(ncryptSilentFlag),
-	)
-	if r != 0 {
+	if r, err := native.signHash(s.key, digest, sigBuf, &sigSize); r != 0 {
 		return nil, fmt.Errorf("NCryptSignHash: hr=0x%x %v", r, err)
 	}
-	return p1363ToASN1(sigBuf)
+	// Compare as uint64: int(sigSize) would turn negative on 32-bit Windows
+	// for sizes >= 0x80000000 and let the slice below panic.
+	if uint64(sigSize) > uint64(len(sigBuf)) {
+		return nil, fmt.Errorf("NCryptSignHash: reported size %d exceeds buffer %d", sigSize, len(sigBuf))
+	}
+	return p1363ToASN1(sigBuf[:sigSize])
 }
 
+// Close waits for Sign calls holding the lock, then attempts to release the
+// key and provider handles. Each handle gets at most one free attempt, even if
+// freeing fails: a handle is never retried, because a failed NCryptFreeObject
+// leaves its state unknown. The first Close reports free failures; later calls
+// return nil and make no further attempt.
 func (s *cngSigner) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	native := s.ops()
+
+	var errs []error
 	if s.key != 0 {
-		procNCryptFreeObject.Call(s.key)
+		if r := native.freeObject(s.key); r != 0 {
+			errs = append(errs, fmt.Errorf("NCryptFreeObject (key %s): hr=0x%x", s.name, r))
+		}
 		s.key = 0
 	}
 	if s.provider != 0 {
-		procNCryptFreeObject.Call(s.provider)
+		if r := native.freeObject(s.provider); r != 0 {
+			errs = append(errs, fmt.Errorf("NCryptFreeObject (provider): hr=0x%x", r))
+		}
 		s.provider = 0
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func exportPublicKey(key uintptr) (*ecdsa.PublicKey, error) {
