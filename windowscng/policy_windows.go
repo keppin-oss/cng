@@ -209,7 +209,7 @@ func checkKeyPolicy(k storedKey, s policySpec) error {
 		return err
 	}
 	if _, err := k.publicKey(); err != nil {
-		return fmt.Errorf("%w: key is not a valid ECDSA P-256 key: %v", ErrPolicyMismatch, err)
+		return fmt.Errorf("%w: key is not a valid ECDSA P-256 key: %w", ErrPolicyMismatch, err)
 	}
 	return checkDACLState(k, s)
 }
@@ -332,8 +332,11 @@ func loadOrCreateSpec(ks keyStore, name string, s policySpec) (Signer, error) {
 	}
 	signer, err := k.signer()
 	if err != nil {
-		k.close()
-		return nil, err
+		// The key was created by this call and a failed signer() leaves its
+		// handles with k: delete it through the same handle, never by name.
+		// deleteCreated ends k's lifetime (delete consumes or frees the key
+		// handle, then the provider is released), so k.close is not called.
+		return nil, cleanupCreatedKey(err, k.deleteCreated)
 	}
 	return signer, nil
 }
@@ -367,7 +370,7 @@ func applySpec(ks keyStore, name string, want policySpec) error {
 		return fmt.Errorf("key %q: %w", name, err)
 	}
 	if _, err := k.publicKey(); err != nil {
-		return fmt.Errorf("key %q: %w: key is not a valid ECDSA P-256 key: %v", name, ErrPolicyMismatch, err)
+		return fmt.Errorf("key %q: %w: key is not a valid ECDSA P-256 key: %w", name, ErrPolicyMismatch, err)
 	}
 	sd, err := k.securityDescriptor()
 	if err != nil {

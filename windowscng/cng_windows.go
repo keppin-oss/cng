@@ -617,20 +617,40 @@ func deleteKey(name string) error {
 	return nil
 }
 
-// openKey opens an existing persisted key and never creates it.
-// On successful return, the cngSigner owns both the provider and key handles.
-func openKey(name string) (Signer, error) {
-	provider, err := openProvider()
-	if err != nil {
-		return nil, err
-	}
+// legacyKeyOps is the set of native operations performed by Open and
+// LoadOrCreate. Production code uses nativeLegacyKeyOps; unit tests inject a
+// simulated backend so that the handle-ownership and cleanup control flow can
+// be verified without touching any real persisted CNG key.
+type legacyKeyOps interface {
+	// openProvider opens the Microsoft Software KSP. The caller owns the
+	// returned provider handle.
+	openProvider() (uintptr, error)
+	// openKey runs NCryptOpenKey for the exact name and returns the key
+	// handle and the native HRESULT (0 on success).
+	openKey(provider uintptr, nameUTF16 *uint16) (keyHandle, hr uintptr)
+	// createKey creates and finalizes a new key without overwrite (see
+	// createPersistedKey). On failure it has already released or deleted what
+	// it created and returns a zero handle.
+	createKey(provider uintptr, nameUTF16 *uint16) (uintptr, error)
+	// validate checks the export policy and persisted DACL of a key handle.
+	validate(keyHandle uintptr) error
+	// newSigner exports the public key and builds a signer that owns provider
+	// and keyHandle. On failure ownership of both handles stays with the caller.
+	newSigner(provider, keyHandle uintptr, name string) (Signer, error)
+	// deleteCreated deletes the key identified by keyHandle, with the handle
+	// contract of deletePersistedKey: success consumes the handle, failure
+	// frees it once. It never looks the key up by name.
+	deleteCreated(keyHandle uintptr) error
+	// free runs NCryptFreeObject on a provider or key handle.
+	free(h uintptr)
+}
 
-	nameUTF16, err := syscall.UTF16PtrFromString(name)
-	if err != nil {
-		procNCryptFreeObject.Call(provider)
-		return nil, fmt.Errorf("convert key name: %w", err)
-	}
+// nativeLegacyKeyOps calls ncrypt.dll.
+type nativeLegacyKeyOps struct{}
 
+func (nativeLegacyKeyOps) openProvider() (uintptr, error) { return openProvider() }
+
+func (nativeLegacyKeyOps) openKey(provider uintptr, nameUTF16 *uint16) (uintptr, uintptr) {
 	var keyHandle uintptr
 	r, _, _ := procNCryptOpenKey.Call(
 		provider,
@@ -639,8 +659,52 @@ func openKey(name string) (Signer, error) {
 		0,
 		uintptr(openKeyFlags),
 	)
+	return keyHandle, r
+}
+
+func (nativeLegacyKeyOps) createKey(provider uintptr, nameUTF16 *uint16) (uintptr, error) {
+	return createPersistedKey(provider, nameUTF16, keySecuritySDDL)
+}
+
+func (nativeLegacyKeyOps) validate(keyHandle uintptr) error {
+	return validatePersistedKey(keyHandle)
+}
+
+func (nativeLegacyKeyOps) newSigner(provider, keyHandle uintptr, name string) (Signer, error) {
+	s, err := newCNGSigner(provider, keyHandle, name)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (nativeLegacyKeyOps) deleteCreated(keyHandle uintptr) error {
+	return deletePersistedKey(keyHandle)
+}
+
+func (nativeLegacyKeyOps) free(h uintptr) { procNCryptFreeObject.Call(h) }
+
+// openKey opens an existing persisted key and never creates it.
+// On successful return, the cngSigner owns both the provider and key handles.
+func openKey(name string) (Signer, error) {
+	return openKeyWith(nativeLegacyKeyOps{}, name)
+}
+
+func openKeyWith(ops legacyKeyOps, name string) (Signer, error) {
+	provider, err := ops.openProvider()
+	if err != nil {
+		return nil, err
+	}
+
+	nameUTF16, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		ops.free(provider)
+		return nil, fmt.Errorf("convert key name: %w", err)
+	}
+
+	keyHandle, r := ops.openKey(provider, nameUTF16)
 	if r != 0 {
-		procNCryptFreeObject.Call(provider)
+		ops.free(provider)
 		if IsKeyNotFound(r) {
 			return nil, fmt.Errorf("key %q: NCryptOpenKey hr=0x%x: %w", name, r, ErrKeyNotFound)
 		}
@@ -649,16 +713,16 @@ func openKey(name string) (Signer, error) {
 
 	// Existing keys are security-sensitive state. Revalidate every time before
 	// exposing a signer; proximity/name knowledge is not trust.
-	if err := validatePersistedKey(keyHandle); err != nil {
-		procNCryptFreeObject.Call(keyHandle)
-		procNCryptFreeObject.Call(provider)
+	if err := ops.validate(keyHandle); err != nil {
+		ops.free(keyHandle)
+		ops.free(provider)
 		return nil, fmt.Errorf("existing key %s failed security validation: %w", name, err)
 	}
 
-	signer, err := newCNGSigner(provider, keyHandle, name)
+	signer, err := ops.newSigner(provider, keyHandle, name)
 	if err != nil {
-		procNCryptFreeObject.Call(keyHandle)
-		procNCryptFreeObject.Call(provider)
+		ops.free(keyHandle)
+		ops.free(provider)
 		return nil, err
 	}
 	return signer, nil
@@ -667,58 +731,63 @@ func openKey(name string) (Signer, error) {
 // loadOrCreateKey opens an existing persisted key or creates a new one.
 // On successful return, the cngSigner owns both the provider and key handles.
 func loadOrCreateKey(name string) (Signer, error) {
-	provider, err := openProvider()
+	return loadOrCreateKeyWith(nativeLegacyKeyOps{}, name)
+}
+
+func loadOrCreateKeyWith(ops legacyKeyOps, name string) (Signer, error) {
+	provider, err := ops.openProvider()
 	if err != nil {
 		return nil, err
 	}
 
 	nameUTF16, err := syscall.UTF16PtrFromString(name)
 	if err != nil {
-		procNCryptFreeObject.Call(provider)
+		ops.free(provider)
 		return nil, fmt.Errorf("convert key name: %w", err)
 	}
 
-	var keyHandle uintptr
-	r, _, _ := procNCryptOpenKey.Call(
-		provider,
-		uintptr(unsafe.Pointer(&keyHandle)),
-		uintptr(unsafe.Pointer(nameUTF16)),
-		0,
-		uintptr(openKeyFlags),
-	)
+	keyHandle, r := ops.openKey(provider, nameUTF16)
 	if r == 0 {
 		// Existing keys are security-sensitive state. Revalidate every time
 		// before exposing a signer; proximity/name knowledge is not trust.
-		if err := validatePersistedKey(keyHandle); err != nil {
-			procNCryptFreeObject.Call(keyHandle)
-			procNCryptFreeObject.Call(provider)
+		// A key opened here was not created by this call: it is never deleted.
+		if err := ops.validate(keyHandle); err != nil {
+			ops.free(keyHandle)
+			ops.free(provider)
 			return nil, fmt.Errorf("existing key %s failed security validation: %w", name, err)
 		}
-		signer, err := newCNGSigner(provider, keyHandle, name)
+		signer, err := ops.newSigner(provider, keyHandle, name)
 		if err != nil {
-			procNCryptFreeObject.Call(keyHandle)
-			procNCryptFreeObject.Call(provider)
+			ops.free(keyHandle)
+			ops.free(provider)
 			return nil, err
 		}
 		return signer, nil
 	}
 
-	keyHandle, err = createPersistedKey(provider, nameUTF16, keySecuritySDDL)
+	// createKey never overwrites: a successful return proves that this call
+	// created the key behind keyHandle. On failure it has already handled its
+	// own cleanup, and nothing else may be deleted here.
+	keyHandle, err = ops.createKey(provider, nameUTF16)
 	if err != nil {
-		procNCryptFreeObject.Call(provider)
+		ops.free(provider)
 		return nil, err
 	}
 
-	if err := validatePersistedKey(keyHandle); err != nil {
-		err = cleanupCreatedKey(err, func() error { return deletePersistedKey(keyHandle) })
-		procNCryptFreeObject.Call(provider)
+	if err := ops.validate(keyHandle); err != nil {
+		err = cleanupCreatedKey(err, func() error { return ops.deleteCreated(keyHandle) })
+		ops.free(provider)
 		return nil, fmt.Errorf("created key %q failed security validation: %w", name, err)
 	}
 
-	signer, err := newCNGSigner(provider, keyHandle, name)
+	signer, err := ops.newSigner(provider, keyHandle, name)
 	if err != nil {
-		procNCryptFreeObject.Call(keyHandle)
-		procNCryptFreeObject.Call(provider)
+		// The key was created by this call and the signer did not take the
+		// handles: delete it through the same handle, never by name. The
+		// delete consumes keyHandle on success and frees it on failure, so it
+		// must not be freed again here; only the provider remains to release.
+		err = cleanupCreatedKey(err, func() error { return ops.deleteCreated(keyHandle) })
+		ops.free(provider)
 		return nil, err
 	}
 	return signer, nil
@@ -939,30 +1008,69 @@ func (s *cngSigner) Close() error {
 	return errors.Join(errs...)
 }
 
-func exportPublicKey(key uintptr) (*ecdsa.PublicKey, error) {
-	var blobSize uint32
+// ncryptExportFunc runs one NCryptExportKey of the ECC public blob of key and
+// returns its SECURITY_STATUS (0 on success). With out == nil it is the size
+// query (no output buffer, capacity 0); otherwise it fills out, whose length is
+// the capacity. result receives the size reported by the call: the required
+// size for the query, the number of bytes written for the fill.
+type ncryptExportFunc func(key uintptr, out []byte, result *uint32) uintptr
+
+// nativeExportECCPublicBlob is the production ncryptExportFunc. Each Go
+// pointer is converted to uintptr inside the Call argument list, as the
+// go:uintptrescapes contract of systemProc.Call requires.
+func nativeExportECCPublicBlob(key uintptr, out []byte, result *uint32) uintptr {
+	if out == nil {
+		r, _, _ := procNCryptExportKey.Call(
+			key, 0,
+			uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(bcryptECCPublicBlob))),
+			0, 0, 0,
+			uintptr(unsafe.Pointer(result)), 0,
+		)
+		return r
+	}
 	r, _, _ := procNCryptExportKey.Call(
 		key, 0,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(bcryptECCPublicBlob))),
-		0, 0, 0,
-		uintptr(unsafe.Pointer(&blobSize)), 0,
+		0,
+		uintptr(unsafe.Pointer(&out[0])), uintptr(len(out)),
+		uintptr(unsafe.Pointer(result)), 0,
 	)
-	if r != 0 {
+	return r
+}
+
+func exportPublicKey(key uintptr) (*ecdsa.PublicKey, error) {
+	return exportPublicKeyWith(key, nativeExportECCPublicBlob)
+}
+
+// exportPublicKeyWith queries the size of the ECC public blob, fills a buffer
+// of that capacity and parses only the bytes the fill reports as written.
+// A nonzero status always wins and keeps its phase and code. A zero size from
+// a successful query, and a fill that reports zero bytes or more bytes than
+// the capacity, are returned as errors before the buffer is used. It never
+// retries and never releases or deletes the key.
+func exportPublicKeyWith(key uintptr, export ncryptExportFunc) (*ecdsa.PublicKey, error) {
+	var queried uint32
+	if r := export(key, nil, &queried); r != 0 {
 		return nil, fmt.Errorf("NCryptExportKey (query size): hr=0x%x", r)
 	}
+	if queried == 0 {
+		return nil, fmt.Errorf("NCryptExportKey (query size): reported size 0")
+	}
 
-	blob := make([]byte, blobSize)
-	r, _, _ = procNCryptExportKey.Call(
-		key, 0,
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(bcryptECCPublicBlob))),
-		0,
-		uintptr(unsafe.Pointer(&blob[0])), uintptr(blobSize),
-		uintptr(unsafe.Pointer(&blobSize)), 0,
-	)
-	if r != 0 {
+	blob := make([]byte, queried)
+	var written uint32
+	if r := export(key, blob, &written); r != 0 {
 		return nil, fmt.Errorf("NCryptExportKey: hr=0x%x", r)
 	}
-	return parseECCPublicBlob(blob)
+	if written == 0 {
+		return nil, fmt.Errorf("NCryptExportKey: reported 0 bytes written")
+	}
+	// Compare as uint64 before any conversion or slicing, so that the check
+	// cannot overflow on 32-bit Windows.
+	if uint64(written) > uint64(len(blob)) {
+		return nil, fmt.Errorf("NCryptExportKey: reported %d bytes written, exceeds buffer %d", written, len(blob))
+	}
+	return parseECCPublicBlob(blob[:written])
 }
 
 func parseECCPublicBlob(blob []byte) (*ecdsa.PublicKey, error) {
