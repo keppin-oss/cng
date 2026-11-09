@@ -144,9 +144,17 @@ and `windowscng.Open(name)`. Runnable examples are in [`examples/`](../examples/
   SERVICE with an unrestricted service SID, keys created by
   `LoadOrCreateForService`. Other KSPs, Windows builds, restricted SIDs and
   keys migrated with `ApplyServicePolicy` are not covered.
-- **Lifecycle.** Call `Close` when done and do not run it concurrently with
-  `Sign` on the same signer. Coordinate provisioning and deletion outside this
-  module; use `Delete` only for keys your application owns.
+- **Lifecycle.** Call `Close` when done. A signer is safe for concurrent use:
+  `Sign` calls may run in parallel, and `Close` waits for those already in
+  progress, then makes at most one release attempt per handle. Overlapping
+  `Sign` and `Close` calls are ordered by an internal lock, so a `Sign` that
+  overlaps `Close` may still complete; once `Close` has returned, every `Sign`
+  fails without reaching CNG. Repeated `Close` calls are harmless; only the
+  first reports a failure to release a handle, and none retries it. `Close` does
+  not drain your callers: stop and drain the users of the signer (for example,
+  in-flight TLS handshakes) before closing it. Coordinate provisioning and
+  deletion outside this module; use `Delete` only for keys your application
+  owns.
 
 ## Building and testing
 
