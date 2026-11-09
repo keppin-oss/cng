@@ -332,8 +332,11 @@ func loadOrCreateSpec(ks keyStore, name string, s policySpec) (Signer, error) {
 	}
 	signer, err := k.signer()
 	if err != nil {
-		k.close()
-		return nil, err
+		// The key was created by this call and a failed signer() leaves its
+		// handles with k: delete it through the same handle, never by name.
+		// deleteCreated ends k's lifetime (delete consumes or frees the key
+		// handle, then the provider is released), so k.close is not called.
+		return nil, cleanupCreatedKey(err, k.deleteCreated)
 	}
 	return signer, nil
 }
