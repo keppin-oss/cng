@@ -1008,30 +1008,69 @@ func (s *cngSigner) Close() error {
 	return errors.Join(errs...)
 }
 
-func exportPublicKey(key uintptr) (*ecdsa.PublicKey, error) {
-	var blobSize uint32
+// ncryptExportFunc runs one NCryptExportKey of the ECC public blob of key and
+// returns its SECURITY_STATUS (0 on success). With out == nil it is the size
+// query (no output buffer, capacity 0); otherwise it fills out, whose length is
+// the capacity. result receives the size reported by the call: the required
+// size for the query, the number of bytes written for the fill.
+type ncryptExportFunc func(key uintptr, out []byte, result *uint32) uintptr
+
+// nativeExportECCPublicBlob is the production ncryptExportFunc. Each Go
+// pointer is converted to uintptr inside the Call argument list, as the
+// go:uintptrescapes contract of systemProc.Call requires.
+func nativeExportECCPublicBlob(key uintptr, out []byte, result *uint32) uintptr {
+	if out == nil {
+		r, _, _ := procNCryptExportKey.Call(
+			key, 0,
+			uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(bcryptECCPublicBlob))),
+			0, 0, 0,
+			uintptr(unsafe.Pointer(result)), 0,
+		)
+		return r
+	}
 	r, _, _ := procNCryptExportKey.Call(
 		key, 0,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(bcryptECCPublicBlob))),
-		0, 0, 0,
-		uintptr(unsafe.Pointer(&blobSize)), 0,
+		0,
+		uintptr(unsafe.Pointer(&out[0])), uintptr(len(out)),
+		uintptr(unsafe.Pointer(result)), 0,
 	)
-	if r != 0 {
+	return r
+}
+
+func exportPublicKey(key uintptr) (*ecdsa.PublicKey, error) {
+	return exportPublicKeyWith(key, nativeExportECCPublicBlob)
+}
+
+// exportPublicKeyWith queries the size of the ECC public blob, fills a buffer
+// of that capacity and parses only the bytes the fill reports as written.
+// A nonzero status always wins and keeps its phase and code. A zero size from
+// a successful query, and a fill that reports zero bytes or more bytes than
+// the capacity, are returned as errors before the buffer is used. It never
+// retries and never releases or deletes the key.
+func exportPublicKeyWith(key uintptr, export ncryptExportFunc) (*ecdsa.PublicKey, error) {
+	var queried uint32
+	if r := export(key, nil, &queried); r != 0 {
 		return nil, fmt.Errorf("NCryptExportKey (query size): hr=0x%x", r)
 	}
+	if queried == 0 {
+		return nil, fmt.Errorf("NCryptExportKey (query size): reported size 0")
+	}
 
-	blob := make([]byte, blobSize)
-	r, _, _ = procNCryptExportKey.Call(
-		key, 0,
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(bcryptECCPublicBlob))),
-		0,
-		uintptr(unsafe.Pointer(&blob[0])), uintptr(blobSize),
-		uintptr(unsafe.Pointer(&blobSize)), 0,
-	)
-	if r != 0 {
+	blob := make([]byte, queried)
+	var written uint32
+	if r := export(key, blob, &written); r != 0 {
 		return nil, fmt.Errorf("NCryptExportKey: hr=0x%x", r)
 	}
-	return parseECCPublicBlob(blob)
+	if written == 0 {
+		return nil, fmt.Errorf("NCryptExportKey: reported 0 bytes written")
+	}
+	// Compare as uint64 before any conversion or slicing, so that the check
+	// cannot overflow on 32-bit Windows.
+	if uint64(written) > uint64(len(blob)) {
+		return nil, fmt.Errorf("NCryptExportKey: reported %d bytes written, exceeds buffer %d", written, len(blob))
+	}
+	return parseECCPublicBlob(blob[:written])
 }
 
 func parseECCPublicBlob(blob []byte) (*ecdsa.PublicKey, error) {

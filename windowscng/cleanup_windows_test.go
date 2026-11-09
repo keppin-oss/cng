@@ -567,3 +567,95 @@ func TestLegacyOpenNeverCreatesOrDeletes(t *testing.T) {
 		_ = signer.Close()
 	})
 }
+
+// TestLegacyZeroSizeExportComposition feeds the error that exportPublicKeyWith
+// really returns for a zero-size query into the legacy newSigner seam, where
+// newCNGSigner would surface it, and checks that the R2 ownership rules apply.
+func TestLegacyZeroSizeExportComposition(t *testing.T) {
+	requireNCryptNotLoaded(t)
+	zeroErr := zeroSizeExportError(t)
+	t.Run("new key, delete succeeds", func(t *testing.T) {
+		o := newFakeLegacyOps(t)
+		o.allowCreate = true
+		o.signerErr = zeroErr
+		signer, err := loadOrCreateKeyWith(o, legacyTestKey)
+		if signer != nil || !errors.Is(err, zeroErr) || errors.Is(err, ErrCleanupFailed) || !strings.Contains(err.Error(), "was deleted") {
+			t.Fatalf("signer=%v err = %v, want the zero-size cause and the deletion reported", signer, err)
+		}
+		if len(o.deletedHandles) != 1 || o.deletedHandles[0] != o.createdHandle || o.created.present || o.frees != 1 {
+			t.Fatalf("deletes=%v frees=%d, want one delete on the created handle and the provider freed once", o.deletedHandles, o.frees)
+		}
+		o.requireReleased()
+	})
+	t.Run("new key, delete fails", func(t *testing.T) {
+		o := newFakeLegacyOps(t)
+		o.allowCreate = true
+		o.signerErr = zeroErr
+		o.deleteErr = errors.New("NCryptDeleteKey: hr=0x80090010")
+		_, err := loadOrCreateKeyWith(o, legacyTestKey)
+		if !errors.Is(err, zeroErr) || !errors.Is(err, ErrCleanupFailed) {
+			t.Fatalf("err = %v, want the zero-size cause and ErrCleanupFailed", err)
+		}
+		if len(o.deletedHandles) != 1 || !o.created.present || o.frees != 2 {
+			t.Fatalf("deletes=%d frees=%d, want one delete, key freed once after it, provider once", len(o.deletedHandles), o.frees)
+		}
+		o.requireReleased()
+	})
+	t.Run("pre-existing key: no delete", func(t *testing.T) {
+		o := newFakeLegacyOps(t)
+		existing := o.persist(legacyTestKey)
+		o.signerErr = zeroErr
+		_, err := loadOrCreateKeyWith(o, legacyTestKey)
+		if !errors.Is(err, zeroErr) || errors.Is(err, ErrCleanupFailed) {
+			t.Fatalf("err = %v", err)
+		}
+		if o.creates != 0 || len(o.deletedHandles) != 0 || !existing.present || o.frees != 2 {
+			t.Fatalf("creates=%d deletes=%d frees=%d", o.creates, len(o.deletedHandles), o.frees)
+		}
+		o.requireReleased()
+	})
+	t.Run("Open: no create or delete", func(t *testing.T) {
+		o := newFakeLegacyOps(t)
+		existing := o.persist(legacyTestKey)
+		o.signerErr = zeroErr
+		_, err := openKeyWith(o, legacyTestKey)
+		if !errors.Is(err, zeroErr) || errors.Is(err, ErrCleanupFailed) {
+			t.Fatalf("err = %v", err)
+		}
+		if o.creates != 0 || len(o.deletedHandles) != 0 || !existing.present || o.frees != 2 {
+			t.Fatalf("creates=%d deletes=%d frees=%d", o.creates, len(o.deletedHandles), o.frees)
+		}
+		o.requireReleased()
+	})
+	t.Run("identity: replacement under the same name survives", func(t *testing.T) {
+		o := newFakeLegacyOps(t)
+		o.allowCreate = true
+		o.signerErr = zeroErr
+		var replacement *fakeLegacyObject
+		o.afterCreate = func(o *fakeLegacyOps) {
+			replacement = &fakeLegacyObject{id: 999, name: legacyTestKey, present: true}
+			o.byName[legacyTestKey] = replacement
+		}
+		if _, err := loadOrCreateKeyWith(o, legacyTestKey); !errors.Is(err, zeroErr) {
+			t.Fatalf("err = %v", err)
+		}
+		if o.created.present || !replacement.present || o.byName[legacyTestKey] != replacement || o.opens != 1 {
+			t.Fatal("rollback must delete the created object through its handle only")
+		}
+		o.requireReleased()
+	})
+	t.Run("collision: concurrent key preserved", func(t *testing.T) {
+		o := newFakeLegacyOps(t)
+		o.allowCreate = true
+		o.signerErr = zeroErr // never reached: create fails first
+		var concurrent *fakeLegacyObject
+		o.beforeCreate = func(o *fakeLegacyOps) { concurrent = o.persist(legacyTestKey) }
+		if _, err := loadOrCreateKeyWith(o, legacyTestKey); err == nil {
+			t.Fatal("want the create collision")
+		}
+		if len(o.deletedHandles) != 0 || !concurrent.present || o.signerCalls != 0 {
+			t.Fatal("collision must not delete or build a signer")
+		}
+		o.requireReleased()
+	})
+}

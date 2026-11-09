@@ -760,3 +760,147 @@ func TestCheckTokenMembershipReadOnly(t *testing.T) {
 		t.Fatalf("callerPrivileged: %v", err)
 	}
 }
+
+// TestPolicyZeroSizeExportComposition feeds the error that exportPublicKeyWith
+// really returns for a zero-size query into the policy/service fake, at the
+// first export (publicKey, used by checkKeyPolicy and applySpec) and at the
+// second export (signer, wrapped as newCNGSigner does).
+func TestPolicyZeroSizeExportComposition(t *testing.T) {
+	requireNCryptNotLoaded(t)
+	zeroErr := zeroSizeExportError(t)
+	signerZeroErr := fmt.Errorf("export public key for %s: %w", testKey, zeroErr)
+	servicePolicy := mustServicePolicy(t, testServiceName)
+	loadOrCreate := func(s *fakeStore, service bool) (Signer, error) {
+		if service {
+			return loadOrCreateForService(s, testKey, servicePolicy)
+		}
+		return loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
+	}
+	for _, service := range []bool{false, true} {
+		label := "with-policy"
+		if service {
+			label = "for-service"
+		}
+		for _, deleteFails := range []bool{false, true} {
+			suffix := ", delete succeeds"
+			if deleteFails {
+				suffix = ", delete fails"
+			}
+			t.Run(label+": new key, zero at first export"+suffix, func(t *testing.T) {
+				s := newFakeStore(t)
+				s.privileged = true
+				s.pubErr = zeroErr
+				if deleteFails {
+					s.deleteErr = errors.New("NCryptDeleteKey: hr=0x80090010")
+				}
+				_, err := loadOrCreate(s, service)
+				if !errors.Is(err, ErrPolicyMismatch) || !errors.Is(err, zeroErr) {
+					t.Fatalf("err = %v, want ErrPolicyMismatch and the zero-size cause (C2)", err)
+				}
+				if errors.Is(err, ErrCleanupFailed) != deleteFails {
+					t.Fatalf("err = %v, ErrCleanupFailed must be present only when the delete fails", err)
+				}
+				if len(s.creates) != 1 || len(s.deleted) != 1 || s.signerCalls != 0 {
+					t.Fatalf("creates=%d deleted=%d signerCalls=%d, want 1/1/0", len(s.creates), len(s.deleted), s.signerCalls)
+				}
+				assertHandlesReleased(t, s)
+			})
+			t.Run(label+": new key, zero at signer export"+suffix, func(t *testing.T) {
+				s := newFakeStore(t)
+				s.privileged = true
+				s.signerErr = signerZeroErr
+				if deleteFails {
+					s.deleteErr = errors.New("NCryptDeleteKey: hr=0x80090010")
+				}
+				_, err := loadOrCreate(s, service)
+				if !errors.Is(err, zeroErr) || errors.Is(err, ErrPolicyMismatch) {
+					t.Fatalf("err = %v, want the zero-size cause from the signer", err)
+				}
+				if errors.Is(err, ErrCleanupFailed) != deleteFails {
+					t.Fatalf("err = %v, ErrCleanupFailed must be present only when the delete fails", err)
+				}
+				if len(s.deleted) != 1 || s.signerCalls != 1 || len(s.deletedKeys) != 1 || !s.deletedKeys[0].created {
+					t.Fatalf("deleted=%d signerCalls=%d, want one delete of the created key", len(s.deleted), s.signerCalls)
+				}
+				if _, ok := s.persisted[testKey]; ok == !deleteFails {
+					t.Fatalf("persisted=%v after delete (fails=%v)", ok, deleteFails)
+				}
+				assertHandlesReleased(t, s)
+			})
+		}
+	}
+	t.Run("existing key, zero at first export: no delete", func(t *testing.T) {
+		for _, open := range []bool{false, true} {
+			s := newFakeStore(t)
+			s.privileged = true
+			s.persisted[testKey] = serviceSignerDescriptor(t, genericRead|genericExecute)
+			s.pubErr = zeroErr
+			var err error
+			if open {
+				_, err = openWithPolicy(s, testKey, PolicyServiceSigner)
+			} else {
+				_, err = loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
+			}
+			if !errors.Is(err, ErrPolicyMismatch) || !errors.Is(err, zeroErr) || errors.Is(err, ErrCleanupFailed) {
+				t.Fatalf("open=%v err = %v", open, err)
+			}
+			assertNoMutation(t, s)
+			assertHandlesReleased(t, s)
+		}
+	})
+	t.Run("existing key, zero at signer export: no delete", func(t *testing.T) {
+		for _, open := range []bool{false, true} {
+			s := newFakeStore(t)
+			s.privileged = true
+			s.persisted[testKey] = serviceSignerDescriptor(t, genericRead|genericExecute)
+			s.signerErr = signerZeroErr
+			var err error
+			if open {
+				_, err = openWithPolicy(s, testKey, PolicyServiceSigner)
+			} else {
+				_, err = loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
+			}
+			if !errors.Is(err, zeroErr) || errors.Is(err, ErrCleanupFailed) {
+				t.Fatalf("open=%v err = %v", open, err)
+			}
+			assertNoMutation(t, s)
+			assertHandlesReleased(t, s)
+		}
+	})
+	t.Run("existing service-SID key via OpenForService, zero at first export", func(t *testing.T) {
+		s := newFakeStore(t)
+		s.persisted[testKey] = s.descriptorFor(servicePolicy.sddl())
+		s.pubErr = zeroErr
+		_, err := openForService(s, testKey, servicePolicy)
+		if !errors.Is(err, ErrPolicyMismatch) || !errors.Is(err, zeroErr) {
+			t.Fatalf("err = %v", err)
+		}
+		assertNoMutation(t, s)
+		assertHandlesReleased(t, s)
+	})
+	t.Run("ApplyPolicy and ApplyServicePolicy, zero at publicKey", func(t *testing.T) {
+		for _, service := range []bool{false, true} {
+			s := newFakeStore(t)
+			s.privileged = true
+			s.persisted[testKey] = serviceSignerDescriptor(t, genericRead|genericExecute)
+			s.pubErr = zeroErr
+			var err error
+			if service {
+				err = applyServicePolicy(s, testKey, servicePolicy)
+			} else {
+				err = applyPolicy(s, testKey, PolicyPrivilegedOnly)
+			}
+			if !errors.Is(err, ErrPolicyMismatch) || !errors.Is(err, zeroErr) {
+				t.Fatalf("service=%v err = %v, want ErrPolicyMismatch and the zero-size cause (C2)", service, err)
+			}
+			if !strings.Contains(err.Error(), "key is not a valid ECDSA P-256 key: NCryptExportKey (query size): reported size 0") {
+				t.Fatalf("service=%v err = %v, diagnostic text changed", service, err)
+			}
+			if s.opens != 1 || s.sdReads != 0 {
+				t.Fatalf("service=%v opens=%d sdReads=%d, want the export checked before any DACL read", service, s.opens, s.sdReads)
+			}
+			assertNoMutation(t, s)
+			assertHandlesReleased(t, s)
+		}
+	})
+}

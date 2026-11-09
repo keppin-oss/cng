@@ -8,7 +8,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"math/big"
+	"strings"
 	"testing"
 )
 
@@ -325,4 +327,195 @@ func TestEmptyDigestRejected(t *testing.T) {
 	if _, err := s.Sign(nil, nil, nil); err == nil {
 		t.Fatal("Sign with empty digest must fail")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// R2-ZERO: exportPublicKeyWith against a finite fake ncryptExportFunc.
+//
+// The fake only writes Go memory. Every call is checked against the next
+// expected step (key handle, phase, capacity); an extra call, a wrong phase or
+// a wrong capacity fails the test, and done() fails if a step was not reached.
+// exportPublicKeyWith reaches NCrypt only through the export function it is
+// given, so these tests cannot call ncrypt.dll.
+// ---------------------------------------------------------------------------
+
+const fakeExportKey uintptr = 0x5a5a
+
+type exportStep struct {
+	fill    bool    // false: size query (out == nil); true: fill
+	wantCap int     // expected len(out) for a fill
+	status  uintptr // SECURITY_STATUS returned
+	result  uint32  // value stored in *result
+	data    []byte  // copied into out for a fill
+}
+
+type fakeExport struct {
+	t     *testing.T
+	steps []exportStep
+	calls int
+}
+
+func (f *fakeExport) export(key uintptr, out []byte, result *uint32) uintptr {
+	f.t.Helper()
+	if key != fakeExportKey {
+		f.t.Fatalf("export called with key 0x%x, want 0x%x", key, fakeExportKey)
+	}
+	if f.calls >= len(f.steps) {
+		f.t.Fatalf("unexpected export call %d (only %d expected)", f.calls+1, len(f.steps))
+	}
+	s := f.steps[f.calls]
+	f.calls++
+	if s.fill != (out != nil) {
+		f.t.Fatalf("export call %d: fill=%v, want %v", f.calls, out != nil, s.fill)
+	}
+	if s.fill {
+		if len(out) != s.wantCap {
+			f.t.Fatalf("export call %d: capacity %d, want %d", f.calls, len(out), s.wantCap)
+		}
+		copy(out, s.data)
+	}
+	*result = s.result
+	return s.status
+}
+
+func (f *fakeExport) done() {
+	f.t.Helper()
+	if f.calls != len(f.steps) {
+		f.t.Fatalf("export calls = %d, want %d", f.calls, len(f.steps))
+	}
+}
+
+func runFakeExport(t *testing.T, steps ...exportStep) (*ecdsa.PublicKey, error) {
+	t.Helper()
+	f := &fakeExport{t: t, steps: steps}
+	pub, err := exportPublicKeyWith(fakeExportKey, f.export)
+	f.done()
+	if err != nil && pub != nil {
+		t.Fatalf("public key %v returned together with error %v", pub, err)
+	}
+	return pub, err
+}
+
+func validP256Blob() []byte {
+	return buildPublicBlob(elliptic.P256().Params().Gx, elliptic.P256().Params().Gy)
+}
+
+// zeroSizeExportError returns the error that exportPublicKeyWith really
+// produces for a successful size query reporting 0 bytes. Composition tests
+// inject it through the existing legacy and policy seams.
+func zeroSizeExportError(t *testing.T) error {
+	t.Helper()
+	_, err := runFakeExport(t, exportStep{status: 0, result: 0})
+	if err == nil || !strings.Contains(err.Error(), "reported size 0") {
+		t.Fatalf("zero-size export error = %v", err)
+	}
+	return err
+}
+
+func TestExportPublicKeyZeroAndBounds(t *testing.T) {
+	requireNCryptNotLoaded(t)
+	const nteBadData = 0x80090005
+	t.Run("query success, size 0: error, no fill, no panic", func(t *testing.T) {
+		_, err := runFakeExport(t, exportStep{status: 0, result: 0})
+		if err == nil || !strings.Contains(err.Error(), "(query size): reported size 0") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("query error with size 0 keeps status", func(t *testing.T) {
+		_, err := runFakeExport(t, exportStep{status: nteBadData, result: 0})
+		if err == nil || !strings.Contains(err.Error(), "(query size): hr=0x80090005") || strings.Contains(err.Error(), "reported size") {
+			t.Fatalf("err = %v, want the native query status, not a size error", err)
+		}
+	})
+	t.Run("query error with positive size keeps status, no fill", func(t *testing.T) {
+		_, err := runFakeExport(t, exportStep{status: nteBadData, result: 72})
+		if err == nil || !strings.Contains(err.Error(), "(query size): hr=0x80090005") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	for _, written := range []uint32{0, 73, 0xffffffff} {
+		t.Run(fmt.Sprintf("fill error with written=%d keeps status", written), func(t *testing.T) {
+			_, err := runFakeExport(t,
+				exportStep{result: 72},
+				exportStep{fill: true, wantCap: 72, status: nteBadData, result: written, data: validP256Blob()})
+			if err == nil || !strings.Contains(err.Error(), "NCryptExportKey: hr=0x80090005") || strings.Contains(err.Error(), "bytes written") {
+				t.Fatalf("err = %v, want the native fill status", err)
+			}
+		})
+	}
+	t.Run("fill success, written 0", func(t *testing.T) {
+		_, err := runFakeExport(t,
+			exportStep{result: 72},
+			exportStep{fill: true, wantCap: 72, result: 0, data: validP256Blob()})
+		if err == nil || !strings.Contains(err.Error(), "reported 0 bytes written") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("fill success, written exceeds capacity by one", func(t *testing.T) {
+		_, err := runFakeExport(t,
+			exportStep{result: 72},
+			exportStep{fill: true, wantCap: 72, result: 73, data: validP256Blob()})
+		if err == nil || !strings.Contains(err.Error(), "reported 73 bytes written, exceeds buffer 72") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("fill success, written 0xffffffff with small buffer", func(t *testing.T) {
+		// A small capacity keeps the allocation tiny; the uint64 comparison
+		// rejects the value before any int conversion or slicing (386-safe).
+		_, err := runFakeExport(t,
+			exportStep{result: 8},
+			exportStep{fill: true, wantCap: 8, result: 0xffffffff, data: validP256Blob()[:8]})
+		if err == nil || !strings.Contains(err.Error(), "reported 4294967295 bytes written, exceeds buffer 8") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("query 80, written 72, valid blob: success", func(t *testing.T) {
+		data := append(validP256Blob(), 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE)
+		pub, err := runFakeExport(t,
+			exportStep{result: 80},
+			exportStep{fill: true, wantCap: 80, result: 72, data: data})
+		if err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		if pub.Curve != elliptic.P256() || pub.X.Cmp(elliptic.P256().Params().Gx) != 0 || pub.Y.Cmp(elliptic.P256().Params().Gy) != 0 {
+			t.Fatal("unexpected public key")
+		}
+	})
+	t.Run("valid blob in buffer, written 71: truncated", func(t *testing.T) {
+		_, err := runFakeExport(t,
+			exportStep{result: 72},
+			exportStep{fill: true, wantCap: 72, result: 71, data: validP256Blob()})
+		if err == nil || !strings.Contains(err.Error(), "ECCPublicBlob truncated") {
+			t.Fatalf("err = %v, want truncation: only the written bytes may be parsed", err)
+		}
+	})
+	t.Run("query 72, written 72, valid blob: success", func(t *testing.T) {
+		pub, err := runFakeExport(t,
+			exportStep{result: 72},
+			exportStep{fill: true, wantCap: 72, result: 72, data: validP256Blob()})
+		if err != nil || pub == nil || pub.X.Cmp(elliptic.P256().Params().Gx) != 0 {
+			t.Fatalf("pub = %v err = %v", pub, err)
+		}
+	})
+	t.Run("malformed blobs are parser errors, no panic", func(t *testing.T) {
+		badMagic := validP256Blob()
+		binary.LittleEndian.PutUint32(badMagic[0:4], 0x12345678)
+		offCurve := buildPublicBlob(big.NewInt(1), big.NewInt(1))
+		for _, tc := range []struct {
+			name, want string
+			data       []byte
+			written    uint32
+		}{
+			{"short header", "too short", validP256Blob()[:7], 7},
+			{"bad magic", "magic", badMagic, 72},
+			{"off curve", "not on P-256", offCurve, 72},
+		} {
+			_, err := runFakeExport(t,
+				exportStep{result: 72},
+				exportStep{fill: true, wantCap: 72, result: tc.written, data: tc.data})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("%s: err = %v, want %q", tc.name, err, tc.want)
+			}
+		}
+	})
 }

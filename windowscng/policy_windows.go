@@ -209,7 +209,7 @@ func checkKeyPolicy(k storedKey, s policySpec) error {
 		return err
 	}
 	if _, err := k.publicKey(); err != nil {
-		return fmt.Errorf("%w: key is not a valid ECDSA P-256 key: %v", ErrPolicyMismatch, err)
+		return fmt.Errorf("%w: key is not a valid ECDSA P-256 key: %w", ErrPolicyMismatch, err)
 	}
 	return checkDACLState(k, s)
 }
@@ -370,7 +370,7 @@ func applySpec(ks keyStore, name string, want policySpec) error {
 		return fmt.Errorf("key %q: %w", name, err)
 	}
 	if _, err := k.publicKey(); err != nil {
-		return fmt.Errorf("key %q: %w: key is not a valid ECDSA P-256 key: %v", name, ErrPolicyMismatch, err)
+		return fmt.Errorf("key %q: %w: key is not a valid ECDSA P-256 key: %w", name, ErrPolicyMismatch, err)
 	}
 	sd, err := k.securityDescriptor()
 	if err != nil {
