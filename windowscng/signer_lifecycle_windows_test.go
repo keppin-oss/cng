@@ -50,6 +50,11 @@ type fakeSignerNative struct {
 	signHR   uintptr
 	freeHR   map[uintptr]uintptr
 
+	// Optional last-error values returned with a failing sizeHR or signHR,
+	// as Proc.Call would return them; nil keeps the default simulated error.
+	sizeCallErr error
+	signCallErr error
+
 	// Optional hooks run inside the simulated syscall, without fake.mu held.
 	sizeHook func()
 	signHook func()
@@ -91,6 +96,9 @@ func (f *fakeSignerNative) signHashSize(key uintptr, digest []byte, size *uint32
 	defer f.mu.Unlock()
 	f.checkKey("signHashSize/return", key)
 	if f.sizeHR != 0 {
+		if f.sizeCallErr != nil {
+			return f.sizeHR, f.sizeCallErr
+		}
 		return f.sizeHR, errors.New("simulated size failure")
 	}
 	*size = f.sizeOut
@@ -110,6 +118,9 @@ func (f *fakeSignerNative) signHash(key uintptr, digest, sig []byte, size *uint3
 	defer f.mu.Unlock()
 	f.checkKey("signHash/return", key)
 	if f.signHR != 0 {
+		if f.signCallErr != nil {
+			return f.signHR, f.signCallErr
+		}
 		return f.signHR, errors.New("simulated sign failure")
 	}
 	copy(sig, f.sig)
