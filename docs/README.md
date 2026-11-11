@@ -132,8 +132,9 @@ and `windowscng.Open(name)`. Runnable examples are in [`examples/`](../examples/
 - **Static check only.** DACL validation inspects the descriptor; it is not a
   computation of Windows effective access (owner rights, privileges, SACL).
 - **Not transactional.** After an error a new key may still exist. If a key was
-  created and validated but building the signer then failed, it stays
-  persisted.
+  created and validated but building the signer then failed, the call deletes
+  that key; if the delete also fails, the error wraps `ErrCleanupFailed` and
+  the key may persist.
 - **Open handles are not revoked.** After `ApplyPolicy` or
   `ApplyServicePolicy`, processes that already opened the key keep working;
   restart or reopen consumers.

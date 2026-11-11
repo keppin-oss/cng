@@ -177,7 +177,7 @@ func Open(name string) (Signer, error) {
 // named name. After a successful native open, it returns a signer only if key
 // validation and public-key loading also succeed. The key must be non-exportable,
 // machine-scoped ECDSA P-256 in the Microsoft Software Key Storage Provider.
-// In v0.1.1, if the native open operation fails, it attempts creation
+// If the native open operation fails, it attempts creation
 // without first classifying every possible open failure as "not found". Callers
 // that need to distinguish an absent key from an inaccessible or otherwise
 // failing key should not treat LoadOrCreate as proof that the key was absent. If
@@ -222,15 +222,25 @@ func openProvider() (uintptr, error) {
 		return 0, err
 	}
 	var provider uintptr
-	r, _, err := procNCryptOpenStorageProvider.Call(
+	r, _, _ := procNCryptOpenStorageProvider.Call(
 		uintptr(unsafe.Pointer(&provider)),
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(msSoftwareKSP))),
 		0,
 	)
 	if r != 0 {
-		return 0, fmt.Errorf("NCryptOpenStorageProvider: hr=0x%x %v", r, err)
+		return 0, ncryptStatusError("NCryptOpenStorageProvider", r)
 	}
 	return provider, nil
+}
+
+// ncryptStatusError formats a failed NCrypt status as "op: hr=0x<status>",
+// lowercase hex without padding. NCrypt functions return their status as a
+// 32-bit SECURITY_STATUS and do not set the thread's last error, so the error
+// value returned by Proc.Call is deliberately not included: it would show
+// ERROR_SUCCESS or an unrelated stale error. Only the low 32 bits of r are
+// formatted, because the upper half of the return register is not defined.
+func ncryptStatusError(op string, r uintptr) error {
+	return fmt.Errorf("%s: hr=0x%x", op, uint32(r))
 }
 
 // buildSecurityDescriptor converts an SDDL string into a self-relative
@@ -473,8 +483,11 @@ func getSecurityDescriptor(keyHandle uintptr) ([]byte, error) {
 		uintptr(unsafe.Pointer(&propLen)),
 		uintptr(daclSecurityInformation),
 	)
-	if r != 0 || propLen == 0 {
+	if r != 0 {
 		return nil, fmt.Errorf("cannot read persisted security descriptor: hr=0x%x", r)
+	}
+	if propLen == 0 {
+		return nil, fmt.Errorf("cannot read persisted security descriptor: reported size 0")
 	}
 
 	buf := make([]byte, propLen)
@@ -489,12 +502,17 @@ func getSecurityDescriptor(keyHandle uintptr) ([]byte, error) {
 	if r != 0 {
 		return nil, fmt.Errorf("NCryptGetProperty(Security Descr): hr=0x%x", r)
 	}
+	// Compare as uint64: int(propLen) would turn negative on 32-bit Windows
+	// for sizes >= 0x80000000 and let the slice below panic.
+	if uint64(propLen) > uint64(len(buf)) {
+		return nil, fmt.Errorf("NCryptGetProperty(Security Descr): reported size %d exceeds buffer %d", propLen, len(buf))
+	}
 	return buf[:propLen], nil
 }
 
 // setSecurityDescriptor writes the DACL portion of sd to the persisted key.
 func setSecurityDescriptor(keyHandle uintptr, sd []byte) error {
-	r, _, err := procNCryptSetProperty.Call(
+	r, _, _ := procNCryptSetProperty.Call(
 		keyHandle,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Security Descr"))),
 		uintptr(unsafe.Pointer(&sd[0])),
@@ -502,7 +520,7 @@ func setSecurityDescriptor(keyHandle uintptr, sd []byte) error {
 		uintptr(daclSecurityInformation),
 	)
 	if r != 0 {
-		return fmt.Errorf("set security descriptor: hr=0x%x %v", r, err)
+		return ncryptStatusError("set security descriptor", r)
 	}
 	return nil
 }
@@ -802,7 +820,7 @@ func loadOrCreateKeyWith(ops legacyKeyOps, name string) (Signer, error) {
 // owned by the caller. On success the caller owns the returned key handle.
 func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintptr, error) {
 	var keyHandle uintptr
-	r, _, err := procNCryptCreatePersistedKey.Call(
+	r, _, _ := procNCryptCreatePersistedKey.Call(
 		provider,
 		uintptr(unsafe.Pointer(&keyHandle)),
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(ecdsaP256Algorithm))),
@@ -811,11 +829,11 @@ func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintp
 		uintptr(ncryptMachineKeyFlag),
 	)
 	if r != 0 {
-		return 0, fmt.Errorf("NCryptCreatePersistedKey: hr=0x%x %v", r, err)
+		return 0, ncryptStatusError("NCryptCreatePersistedKey", r)
 	}
 
 	zero := uint32(0)
-	r, _, err = procNCryptSetProperty.Call(
+	r, _, _ = procNCryptSetProperty.Call(
 		keyHandle,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Export Policy"))),
 		uintptr(unsafe.Pointer(&zero)),
@@ -826,7 +844,7 @@ func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintp
 		// Not finalized, therefore not persisted: releasing the handle is the
 		// whole cleanup.
 		procNCryptFreeObject.Call(keyHandle)
-		return 0, fmt.Errorf("set export policy: hr=0x%x %v", r, err)
+		return 0, ncryptStatusError("set export policy", r)
 	}
 
 	// The DACL is set before NCryptFinalizeKey, so the key is persisted with it
@@ -846,9 +864,9 @@ func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintp
 		return 0, fmt.Errorf("before finalize: %w", err)
 	}
 
-	r, _, err = procNCryptFinalizeKey.Call(keyHandle, 0)
+	r, _, _ = procNCryptFinalizeKey.Call(keyHandle, 0)
 	if r != 0 {
-		return 0, cleanupCreatedKey(fmt.Errorf("NCryptFinalizeKey: hr=0x%x %v", r, err), func() error { return deletePersistedKey(keyHandle) })
+		return 0, cleanupCreatedKey(ncryptStatusError("NCryptFinalizeKey", r), func() error { return deletePersistedKey(keyHandle) })
 	}
 	return keyHandle, nil
 }
@@ -958,16 +976,18 @@ func (s *cngSigner) Sign(_ io.Reader, digest []byte, _ crypto.SignerOpts) ([]byt
 	native := s.ops()
 
 	var sigSize uint32
-	if r, err := native.signHashSize(s.key, digest, &sigSize); r != 0 {
-		return nil, fmt.Errorf("NCryptSignHash (query size): hr=0x%x %v", r, err)
+	// The second result of the native seam is the Proc.Call last error, which
+	// NCryptSignHash does not set; only the returned status is reported.
+	if r, _ := native.signHashSize(s.key, digest, &sigSize); r != 0 {
+		return nil, ncryptStatusError("NCryptSignHash (query size)", r)
 	}
 	if sigSize == 0 {
 		return nil, fmt.Errorf("NCryptSignHash (query size): reported size 0")
 	}
 
 	sigBuf := make([]byte, sigSize)
-	if r, err := native.signHash(s.key, digest, sigBuf, &sigSize); r != 0 {
-		return nil, fmt.Errorf("NCryptSignHash: hr=0x%x %v", r, err)
+	if r, _ := native.signHash(s.key, digest, sigBuf, &sigSize); r != 0 {
+		return nil, ncryptStatusError("NCryptSignHash", r)
 	}
 	// Compare as uint64: int(sigSize) would turn negative on 32-bit Windows
 	// for sizes >= 0x80000000 and let the slice below panic.
