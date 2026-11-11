@@ -342,11 +342,11 @@ func TestEmptyDigestRejected(t *testing.T) {
 const fakeExportKey uintptr = 0x5a5a
 
 type exportStep struct {
-	fill    bool    // false: size query (out == nil); true: fill
-	wantCap int     // expected len(out) for a fill
-	status  uintptr // SECURITY_STATUS returned
-	result  uint32  // value stored in *result
-	data    []byte  // copied into out for a fill
+	fill    bool   // false: size query (out == nil); true: fill
+	wantCap int    // expected len(out) for a fill
+	status  uint32 // SECURITY_STATUS returned
+	result  uint32 // value stored in *result
+	data    []byte // copied into out for a fill
 }
 
 type fakeExport struct {
@@ -355,7 +355,7 @@ type fakeExport struct {
 	calls int
 }
 
-func (f *fakeExport) export(key uintptr, out []byte, result *uint32) uintptr {
+func (f *fakeExport) export(key uintptr, out []byte, result *uint32) uint32 {
 	f.t.Helper()
 	if key != fakeExportKey {
 		f.t.Fatalf("export called with key 0x%x, want 0x%x", key, fakeExportKey)

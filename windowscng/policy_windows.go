@@ -439,8 +439,8 @@ func checkTokenMembership(sidString string) (bool, error) {
 	}
 	defer procLocalFree.Call(uintptr(sid))
 	var member int32
-	r, _, callErr := procCheckTokenMembership.Call(0, uintptr(sid), uintptr(unsafe.Pointer(&member)))
-	if r == 0 {
+	ok, callErr := win32BOOLAndCallErr(procCheckTokenMembership.Call(0, uintptr(sid), uintptr(unsafe.Pointer(&member))))
+	if !ok {
 		return false, fmt.Errorf("CheckTokenMembership(%s): %v", sidString, callErr)
 	}
 	return member != 0, nil
@@ -457,16 +457,16 @@ func (nativeKeyStore) open(name string) (storedKey, error) {
 		return nil, fmt.Errorf("convert key name: %w", err)
 	}
 	var keyHandle uintptr
-	r, _, _ := procNCryptOpenKey.Call(
+	r := ncryptStatus(procNCryptOpenKey.Call(
 		provider,
 		uintptr(unsafe.Pointer(&keyHandle)),
 		uintptr(unsafe.Pointer(nameUTF16)),
 		0,
 		uintptr(openKeyFlags),
-	)
+	))
 	if r != 0 {
 		procNCryptFreeObject.Call(provider)
-		if IsKeyNotFound(r) {
+		if IsKeyNotFound(uintptr(r)) {
 			return nil, fmt.Errorf("key %q: NCryptOpenKey hr=0x%x: %w", name, r, ErrKeyNotFound)
 		}
 		return nil, fmt.Errorf("NCryptOpenKey %q: hr=0x%x", name, r)

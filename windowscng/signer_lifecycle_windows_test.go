@@ -46,9 +46,9 @@ type fakeSignerNative struct {
 	sig      []byte // P1363 signature written by signHash
 	sizeOut  uint32 // size reported by signHashSize (default len(sig))
 	writeOut uint32 // size reported by signHash (default len(sig))
-	sizeHR   uintptr
-	signHR   uintptr
-	freeHR   map[uintptr]uintptr
+	sizeHR   uint32
+	signHR   uint32
+	freeHR   map[uintptr]uint32
 
 	// Optional last-error values returned with a failing sizeHR or signHR,
 	// as Proc.Call would return them; nil keeps the default simulated error.
@@ -72,7 +72,7 @@ func newFakeSignerNative(sig []byte) *fakeSignerNative {
 		sig:      sig,
 		sizeOut:  uint32(len(sig)),
 		writeOut: uint32(len(sig)),
-		freeHR:   map[uintptr]uintptr{},
+		freeHR:   map[uintptr]uint32{},
 		freed:    map[uintptr]int{},
 	}
 }
@@ -83,7 +83,7 @@ func (f *fakeSignerNative) checkKey(op string, key uintptr) {
 	}
 }
 
-func (f *fakeSignerNative) signHashSize(key uintptr, digest []byte, size *uint32) (uintptr, error) {
+func (f *fakeSignerNative) signHashSize(key uintptr, digest []byte, size *uint32) (uint32, error) {
 	f.mu.Lock()
 	f.sizeCalls++
 	f.checkKey("signHashSize/enter", key)
@@ -105,7 +105,7 @@ func (f *fakeSignerNative) signHashSize(key uintptr, digest []byte, size *uint32
 	return 0, nil
 }
 
-func (f *fakeSignerNative) signHash(key uintptr, digest, sig []byte, size *uint32) (uintptr, error) {
+func (f *fakeSignerNative) signHash(key uintptr, digest, sig []byte, size *uint32) (uint32, error) {
 	f.mu.Lock()
 	f.signCalls++
 	f.checkKey("signHash/enter", key)
@@ -128,7 +128,7 @@ func (f *fakeSignerNative) signHash(key uintptr, digest, sig []byte, size *uint3
 	return 0, nil
 }
 
-func (f *fakeSignerNative) freeObject(h uintptr) uintptr {
+func (f *fakeSignerNative) freeObject(h uintptr) uint32 {
 	f.mu.Lock()
 	hook := f.freeHook
 	f.mu.Unlock()
@@ -725,12 +725,12 @@ func TestSignerConcurrentCloseFreesOnce(t *testing.T) {
 func TestSignerCloseReportsFreeFailuresOnce(t *testing.T) {
 	cases := []struct {
 		name    string
-		freeHR  map[uintptr]uintptr
+		freeHR  map[uintptr]uint32
 		wantErr []string
 	}{
-		{"key free fails", map[uintptr]uintptr{fakeKeyHandle: 0x80090026}, []string{"key d3-test-key): hr=0x80090026"}},
-		{"provider free fails", map[uintptr]uintptr{fakeProviderHandle: 0x80090026}, []string{"provider): hr=0x80090026"}},
-		{"both fail", map[uintptr]uintptr{fakeKeyHandle: 0x1, fakeProviderHandle: 0x2}, []string{"key d3-test-key): hr=0x1", "provider): hr=0x2"}},
+		{"key free fails", map[uintptr]uint32{fakeKeyHandle: 0x80090026}, []string{"key d3-test-key): hr=0x80090026"}},
+		{"provider free fails", map[uintptr]uint32{fakeProviderHandle: 0x80090026}, []string{"provider): hr=0x80090026"}},
+		{"both fail", map[uintptr]uint32{fakeKeyHandle: 0x1, fakeProviderHandle: 0x2}, []string{"key d3-test-key): hr=0x1", "provider): hr=0x2"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
