@@ -116,19 +116,19 @@ func (p *nativeConcProbe) exit() {
 	p.mu.Unlock()
 }
 
-func (p *nativeConcProbe) signHashSize(key uintptr, digest []byte, size *uint32) (uintptr, error) {
+func (p *nativeConcProbe) signHashSize(key uintptr, digest []byte, size *uint32) (uint32, error) {
 	p.enter(key, "NCryptSignHash(size)")
 	defer p.exit()
 	return p.inner.signHashSize(key, digest, size)
 }
 
-func (p *nativeConcProbe) signHash(key uintptr, digest, sig []byte, size *uint32) (uintptr, error) {
+func (p *nativeConcProbe) signHash(key uintptr, digest, sig []byte, size *uint32) (uint32, error) {
 	p.enter(key, "NCryptSignHash")
 	defer p.exit()
 	return p.inner.signHash(key, digest, sig, size)
 }
 
-func (p *nativeConcProbe) freeObject(h uintptr) uintptr {
+func (p *nativeConcProbe) freeObject(h uintptr) uint32 {
 	p.mu.Lock()
 	if p.inFlight > 0 {
 		p.violations = append(p.violations, fmt.Sprintf("NCryptFreeObject(0x%x) while %d NCryptSignHash in flight", h, p.inFlight))

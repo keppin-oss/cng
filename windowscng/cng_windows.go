@@ -222,25 +222,54 @@ func openProvider() (uintptr, error) {
 		return 0, err
 	}
 	var provider uintptr
-	r, _, _ := procNCryptOpenStorageProvider.Call(
+	r := ncryptStatus(procNCryptOpenStorageProvider.Call(
 		uintptr(unsafe.Pointer(&provider)),
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(msSoftwareKSP))),
 		0,
-	)
+	))
 	if r != 0 {
 		return 0, ncryptStatusError("NCryptOpenStorageProvider", r)
 	}
 	return provider, nil
 }
 
+// ncryptStatus returns the 32-bit SECURITY_STATUS of an NCrypt call from the
+// results of Proc.Call, used as ncryptStatus(proc.Call(...)). Only the low 32
+// bits of the return register are defined for a SECURITY_STATUS, so every
+// status check and message must use this value, never the raw uintptr. The
+// last error is discarded: NCrypt functions do not set it. The Go pointers
+// stay converted inside the Call argument list, as the go:uintptrescapes
+// contract of systemProc.Call requires.
+func ncryptStatus(r, _ uintptr, _ error) uint32 {
+	return uint32(r)
+}
+
+// ncryptStatusAndCallErr is ncryptStatus for a seam that also hands the
+// Proc.Call last error to its caller.
+func ncryptStatusAndCallErr(r, _ uintptr, err error) (uint32, error) {
+	return uint32(r), err
+}
+
+// win32BOOL reports whether the Win32 BOOL returned by a call is TRUE, used as
+// win32BOOL(proc.Call(...)). BOOL is a 32-bit int: only the low 32 bits of the
+// return register are defined, zero is FALSE and any other value is TRUE.
+func win32BOOL(r, _ uintptr, _ error) bool {
+	return uint32(r) != 0
+}
+
+// win32BOOLAndCallErr is win32BOOL for a caller that also reports the
+// Proc.Call last error, which a Win32 function returning FALSE sets.
+func win32BOOLAndCallErr(r, _ uintptr, err error) (bool, error) {
+	return uint32(r) != 0, err
+}
+
 // ncryptStatusError formats a failed NCrypt status as "op: hr=0x<status>",
 // lowercase hex without padding. NCrypt functions return their status as a
 // 32-bit SECURITY_STATUS and do not set the thread's last error, so the error
 // value returned by Proc.Call is deliberately not included: it would show
-// ERROR_SUCCESS or an unrelated stale error. Only the low 32 bits of r are
-// formatted, because the upper half of the return register is not defined.
-func ncryptStatusError(op string, r uintptr) error {
-	return fmt.Errorf("%s: hr=0x%x", op, uint32(r))
+// ERROR_SUCCESS or an unrelated stale error.
+func ncryptStatusError(op string, r uint32) error {
+	return fmt.Errorf("%s: hr=0x%x", op, r)
 }
 
 // buildSecurityDescriptor converts an SDDL string into a self-relative
@@ -252,13 +281,13 @@ func buildSecurityDescriptor(sddlString string) ([]byte, error) {
 	}
 	var sdPtr unsafe.Pointer
 	var sdSize uint32
-	r, _, err := procConvertStringSecurityDescriptorToSecurityDescriptorW.Call(
+	ok, err := win32BOOLAndCallErr(procConvertStringSecurityDescriptorToSecurityDescriptorW.Call(
 		uintptr(unsafe.Pointer(sddl)),
 		1,
 		uintptr(unsafe.Pointer(&sdPtr)),
 		uintptr(unsafe.Pointer(&sdSize)),
-	)
-	if r == 0 {
+	))
+	if !ok {
 		return nil, fmt.Errorf("ConvertStringSecurityDescriptorToSecurityDescriptorW: %v", err)
 	}
 	defer procLocalFree.Call(uintptr(sdPtr))
@@ -273,11 +302,11 @@ func convertStringSid(sidString string) (unsafe.Pointer, error) {
 		return nil, fmt.Errorf("UTF16 encode SID %s: %w", sidString, err)
 	}
 	var sidPtr unsafe.Pointer
-	r, _, err := procConvertStringSidToSidW.Call(
+	ok, err := win32BOOLAndCallErr(procConvertStringSidToSidW.Call(
 		uintptr(unsafe.Pointer(sidU16)),
 		uintptr(unsafe.Pointer(&sidPtr)),
-	)
-	if r == 0 {
+	))
+	if !ok {
 		return nil, fmt.Errorf("ConvertStringSidToSidW(%s): %v", sidString, err)
 	}
 	return sidPtr, nil
@@ -301,13 +330,13 @@ func verifyDACL(keyHandle uintptr) error {
 	var daclPresent int32
 	var daclDefaulted int32
 	var daclPtr unsafe.Pointer
-	ret, _, _ := procGetSecurityDescriptorDacl.Call(
+	ok := win32BOOL(procGetSecurityDescriptorDacl.Call(
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(unsafe.Pointer(&daclPresent)),
 		uintptr(unsafe.Pointer(&daclPtr)),
 		uintptr(unsafe.Pointer(&daclDefaulted)),
-	)
-	if ret == 0 {
+	))
+	if !ok {
 		return fmt.Errorf("GetSecurityDescriptorDacl failed")
 	}
 	if daclPresent == 0 || daclPtr == nil {
@@ -315,13 +344,13 @@ func verifyDACL(keyHandle uintptr) error {
 	}
 
 	var aclInfo aclSizeInfo
-	ret, _, _ = procGetAclInformation.Call(
+	ok = win32BOOL(procGetAclInformation.Call(
 		uintptr(daclPtr),
 		uintptr(unsafe.Pointer(&aclInfo)),
 		uintptr(unsafe.Sizeof(aclInfo)),
 		uintptr(aclSizeInfoClass),
-	)
-	if ret == 0 {
+	))
+	if !ok {
 		return fmt.Errorf("GetAclInformation failed")
 	}
 	if aclInfo.AceCount == 0 {
@@ -386,12 +415,11 @@ func verifyDACL(keyHandle uintptr) error {
 	var foundSys, foundAdm, foundLS bool
 	for i := uint32(0); i < aclInfo.AceCount; i++ {
 		var acePtr unsafe.Pointer
-		ret, _, _ := procGetAce.Call(
+		if !win32BOOL(procGetAce.Call(
 			uintptr(daclPtr),
 			uintptr(i),
 			uintptr(unsafe.Pointer(&acePtr)),
-		)
-		if ret == 0 {
+		)) {
 			return fmt.Errorf("GetAce(%d) failed", i)
 		}
 
@@ -476,13 +504,13 @@ func verifyDACL(keyHandle uintptr) error {
 // descriptor as a self-relative SECURITY_DESCRIPTOR.
 func getSecurityDescriptor(keyHandle uintptr) ([]byte, error) {
 	var propLen uint32
-	r, _, _ := procNCryptGetProperty.Call(
+	r := ncryptStatus(procNCryptGetProperty.Call(
 		keyHandle,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Security Descr"))),
 		0, 0,
 		uintptr(unsafe.Pointer(&propLen)),
 		uintptr(daclSecurityInformation),
-	)
+	))
 	if r != 0 {
 		return nil, fmt.Errorf("cannot read persisted security descriptor: hr=0x%x", r)
 	}
@@ -491,14 +519,14 @@ func getSecurityDescriptor(keyHandle uintptr) ([]byte, error) {
 	}
 
 	buf := make([]byte, propLen)
-	r, _, _ = procNCryptGetProperty.Call(
+	r = ncryptStatus(procNCryptGetProperty.Call(
 		keyHandle,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Security Descr"))),
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(propLen),
 		uintptr(unsafe.Pointer(&propLen)),
 		uintptr(daclSecurityInformation),
-	)
+	))
 	if r != 0 {
 		return nil, fmt.Errorf("NCryptGetProperty(Security Descr): hr=0x%x", r)
 	}
@@ -512,13 +540,13 @@ func getSecurityDescriptor(keyHandle uintptr) ([]byte, error) {
 
 // setSecurityDescriptor writes the DACL portion of sd to the persisted key.
 func setSecurityDescriptor(keyHandle uintptr, sd []byte) error {
-	r, _, _ := procNCryptSetProperty.Call(
+	r := ncryptStatus(procNCryptSetProperty.Call(
 		keyHandle,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Security Descr"))),
 		uintptr(unsafe.Pointer(&sd[0])),
 		uintptr(len(sd)),
 		uintptr(daclSecurityInformation),
-	)
+	))
 	if r != 0 {
 		return ncryptStatusError("set security descriptor", r)
 	}
@@ -526,21 +554,20 @@ func setSecurityDescriptor(keyHandle uintptr, sd []byte) error {
 }
 
 func matchSid(s1, s2 unsafe.Pointer) bool {
-	r, _, _ := procEqualSid.Call(uintptr(s1), uintptr(s2))
-	return r != 0
+	return win32BOOL(procEqualSid.Call(uintptr(s1), uintptr(s2)))
 }
 
 func verifyExportPolicy(keyHandle uintptr) error {
 	var actualPolicy uint32
 	var outLen uint32
-	r, _, _ := procNCryptGetProperty.Call(
+	r := ncryptStatus(procNCryptGetProperty.Call(
 		keyHandle,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Export Policy"))),
 		uintptr(unsafe.Pointer(&actualPolicy)),
 		uintptr(unsafe.Sizeof(actualPolicy)),
 		uintptr(unsafe.Pointer(&outLen)),
 		uintptr(ncryptSilentFlag),
-	)
+	))
 	if r != 0 {
 		return fmt.Errorf("cannot verify export policy: hr=0x%x", r)
 	}
@@ -566,7 +593,7 @@ func validatePersistedKey(keyHandle uintptr) error {
 func deleteKeyHandle(keyHandle uintptr) error {
 	return deleteCNGKeyHandle(keyHandle,
 		func(h uintptr) error {
-			r, _, _ := procNCryptDeleteKey.Call(h, 0)
+			r := ncryptStatus(procNCryptDeleteKey.Call(h, 0))
 			if r != 0 {
 				return fmt.Errorf("NCryptDeleteKey: hr=0x%x", r)
 			}
@@ -615,15 +642,15 @@ func deleteKey(name string) error {
 	}
 
 	var keyHandle uintptr
-	r, _, _ := procNCryptOpenKey.Call(
+	r := ncryptStatus(procNCryptOpenKey.Call(
 		provider,
 		uintptr(unsafe.Pointer(&keyHandle)),
 		uintptr(unsafe.Pointer(nameUTF16)),
 		0,
 		uintptr(deleteKeyOpenFlags),
-	)
+	))
 	if r != 0 {
-		if IsKeyNotFound(r) {
+		if IsKeyNotFound(uintptr(r)) {
 			return fmt.Errorf("key %q: NCryptOpenKey hr=0x%x: %w", name, r, ErrKeyNotFound)
 		}
 		return fmt.Errorf("NCryptOpenKey %q (for delete): hr=0x%x", name, r)
@@ -644,8 +671,8 @@ type legacyKeyOps interface {
 	// returned provider handle.
 	openProvider() (uintptr, error)
 	// openKey runs NCryptOpenKey for the exact name and returns the key
-	// handle and the native HRESULT (0 on success).
-	openKey(provider uintptr, nameUTF16 *uint16) (keyHandle, hr uintptr)
+	// handle and the native 32-bit status (0 on success).
+	openKey(provider uintptr, nameUTF16 *uint16) (keyHandle uintptr, hr uint32)
 	// createKey creates and finalizes a new key without overwrite (see
 	// createPersistedKey). On failure it has already released or deleted what
 	// it created and returns a zero handle.
@@ -668,15 +695,15 @@ type nativeLegacyKeyOps struct{}
 
 func (nativeLegacyKeyOps) openProvider() (uintptr, error) { return openProvider() }
 
-func (nativeLegacyKeyOps) openKey(provider uintptr, nameUTF16 *uint16) (uintptr, uintptr) {
+func (nativeLegacyKeyOps) openKey(provider uintptr, nameUTF16 *uint16) (uintptr, uint32) {
 	var keyHandle uintptr
-	r, _, _ := procNCryptOpenKey.Call(
+	r := ncryptStatus(procNCryptOpenKey.Call(
 		provider,
 		uintptr(unsafe.Pointer(&keyHandle)),
 		uintptr(unsafe.Pointer(nameUTF16)),
 		0,
 		uintptr(openKeyFlags),
-	)
+	))
 	return keyHandle, r
 }
 
@@ -723,7 +750,7 @@ func openKeyWith(ops legacyKeyOps, name string) (Signer, error) {
 	keyHandle, r := ops.openKey(provider, nameUTF16)
 	if r != 0 {
 		ops.free(provider)
-		if IsKeyNotFound(r) {
+		if IsKeyNotFound(uintptr(r)) {
 			return nil, fmt.Errorf("key %q: NCryptOpenKey hr=0x%x: %w", name, r, ErrKeyNotFound)
 		}
 		return nil, fmt.Errorf("NCryptOpenKey %q: hr=0x%x", name, r)
@@ -820,26 +847,26 @@ func loadOrCreateKeyWith(ops legacyKeyOps, name string) (Signer, error) {
 // owned by the caller. On success the caller owns the returned key handle.
 func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintptr, error) {
 	var keyHandle uintptr
-	r, _, _ := procNCryptCreatePersistedKey.Call(
+	r := ncryptStatus(procNCryptCreatePersistedKey.Call(
 		provider,
 		uintptr(unsafe.Pointer(&keyHandle)),
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(ecdsaP256Algorithm))),
 		uintptr(unsafe.Pointer(nameUTF16)),
 		0,
 		uintptr(ncryptMachineKeyFlag),
-	)
+	))
 	if r != 0 {
 		return 0, ncryptStatusError("NCryptCreatePersistedKey", r)
 	}
 
 	zero := uint32(0)
-	r, _, _ = procNCryptSetProperty.Call(
+	r = ncryptStatus(procNCryptSetProperty.Call(
 		keyHandle,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Export Policy"))),
 		uintptr(unsafe.Pointer(&zero)),
 		unsafe.Sizeof(zero),
 		uintptr(ncryptSilentFlag),
-	)
+	))
 	if r != 0 {
 		// Not finalized, therefore not persisted: releasing the handle is the
 		// whole cleanup.
@@ -864,7 +891,7 @@ func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintp
 		return 0, fmt.Errorf("before finalize: %w", err)
 	}
 
-	r, _, _ = procNCryptFinalizeKey.Call(keyHandle, 0)
+	r = ncryptStatus(procNCryptFinalizeKey.Call(keyHandle, 0))
 	if r != 0 {
 		return 0, cleanupCreatedKey(ncryptStatusError("NCryptFinalizeKey", r), func() error { return deletePersistedKey(keyHandle) })
 	}
@@ -881,11 +908,11 @@ var errSignerClosed = errors.New("signer is closed")
 type signerNative interface {
 	// signHashSize runs NCryptSignHash without an output buffer to obtain
 	// the signature size.
-	signHashSize(key uintptr, digest []byte, size *uint32) (hr uintptr, callErr error)
+	signHashSize(key uintptr, digest []byte, size *uint32) (hr uint32, callErr error)
 	// signHash runs NCryptSignHash into sig. sig is never empty.
-	signHash(key uintptr, digest, sig []byte, size *uint32) (hr uintptr, callErr error)
+	signHash(key uintptr, digest, sig []byte, size *uint32) (hr uint32, callErr error)
 	// freeObject runs NCryptFreeObject on a provider or key handle.
-	freeObject(h uintptr) (hr uintptr)
+	freeObject(h uintptr) (hr uint32)
 }
 
 // nativeSignerOps calls ncrypt.dll. Each Go pointer is converted to uintptr
@@ -893,31 +920,28 @@ type signerNative interface {
 // systemProc.Call requires.
 type nativeSignerOps struct{}
 
-func (nativeSignerOps) signHashSize(key uintptr, digest []byte, size *uint32) (uintptr, error) {
-	r, _, err := procNCryptSignHash.Call(
+func (nativeSignerOps) signHashSize(key uintptr, digest []byte, size *uint32) (uint32, error) {
+	return ncryptStatusAndCallErr(procNCryptSignHash.Call(
 		key, 0,
 		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
 		0, 0,
 		uintptr(unsafe.Pointer(size)),
 		uintptr(ncryptSilentFlag),
-	)
-	return r, err
+	))
 }
 
-func (nativeSignerOps) signHash(key uintptr, digest, sig []byte, size *uint32) (uintptr, error) {
-	r, _, err := procNCryptSignHash.Call(
+func (nativeSignerOps) signHash(key uintptr, digest, sig []byte, size *uint32) (uint32, error) {
+	return ncryptStatusAndCallErr(procNCryptSignHash.Call(
 		key, 0,
 		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
 		uintptr(unsafe.Pointer(&sig[0])), uintptr(len(sig)),
 		uintptr(unsafe.Pointer(size)),
 		uintptr(ncryptSilentFlag),
-	)
-	return r, err
+	))
 }
 
-func (nativeSignerOps) freeObject(h uintptr) uintptr {
-	r, _, _ := procNCryptFreeObject.Call(h)
-	return r
+func (nativeSignerOps) freeObject(h uintptr) uint32 {
+	return ncryptStatus(procNCryptFreeObject.Call(h))
 }
 
 // cngSigner implements Signer backed by a CNG persisted key.
@@ -1033,29 +1057,27 @@ func (s *cngSigner) Close() error {
 // query (no output buffer, capacity 0); otherwise it fills out, whose length is
 // the capacity. result receives the size reported by the call: the required
 // size for the query, the number of bytes written for the fill.
-type ncryptExportFunc func(key uintptr, out []byte, result *uint32) uintptr
+type ncryptExportFunc func(key uintptr, out []byte, result *uint32) uint32
 
 // nativeExportECCPublicBlob is the production ncryptExportFunc. Each Go
 // pointer is converted to uintptr inside the Call argument list, as the
 // go:uintptrescapes contract of systemProc.Call requires.
-func nativeExportECCPublicBlob(key uintptr, out []byte, result *uint32) uintptr {
+func nativeExportECCPublicBlob(key uintptr, out []byte, result *uint32) uint32 {
 	if out == nil {
-		r, _, _ := procNCryptExportKey.Call(
+		return ncryptStatus(procNCryptExportKey.Call(
 			key, 0,
 			uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(bcryptECCPublicBlob))),
 			0, 0, 0,
 			uintptr(unsafe.Pointer(result)), 0,
-		)
-		return r
+		))
 	}
-	r, _, _ := procNCryptExportKey.Call(
+	return ncryptStatus(procNCryptExportKey.Call(
 		key, 0,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(bcryptECCPublicBlob))),
 		0,
 		uintptr(unsafe.Pointer(&out[0])), uintptr(len(out)),
 		uintptr(unsafe.Pointer(result)), 0,
-	)
-	return r
+	))
 }
 
 func exportPublicKey(key uintptr) (*ecdsa.PublicKey, error) {

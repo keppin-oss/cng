@@ -122,7 +122,7 @@ type fakeLegacyOps struct {
 	nextObj int
 
 	allowCreate  bool
-	openHR       uintptr // forced NCryptOpenKey result, 0 = look up by name
+	openHR       uint32 // forced NCryptOpenKey result, 0 = look up by name
 	createErr    error
 	beforeCreate func(o *fakeLegacyOps)
 	afterCreate  func(o *fakeLegacyOps)
@@ -179,7 +179,7 @@ func (o *fakeLegacyOps) openProvider() (uintptr, error) {
 	return o.newHandle(&fakeLegacyHandle{provider: true}), nil
 }
 
-func (o *fakeLegacyOps) openKey(provider uintptr, nameUTF16 *uint16) (uintptr, uintptr) {
+func (o *fakeLegacyOps) openKey(provider uintptr, nameUTF16 *uint16) (uintptr, uint32) {
 	o.mustLive(provider, "openKey")
 	o.opens++
 	if o.openHR != 0 {
