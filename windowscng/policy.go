@@ -49,7 +49,13 @@ func (p Policy) String() string {
 
 // ErrPolicyMismatch indicates that a persisted key's DACL is not exactly in the
 // state required by the requested Policy, or that a requested policy change is
-// not a permitted transition. The key was not modified.
+// not a permitted transition. No pre-existing key was modified: OpenWithPolicy
+// and the Open... functions never write, and ApplyPolicy/ApplyServicePolicy
+// return it only before writing (a failure after the write is
+// ErrPostWriteVerification). The LoadOrCreate... functions also return it
+// when the key they just created does not hold the policy: that key is then
+// deleted, or, if the delete fails, the error also wraps ErrCleanupFailed and
+// the new key may persist.
 var ErrPolicyMismatch = errors.New("windowscng: persisted key does not match the requested policy")
 
 // ErrPrivilegeRequired indicates that the operation requires the calling

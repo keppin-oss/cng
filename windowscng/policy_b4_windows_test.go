@@ -94,7 +94,7 @@ func TestB4LegacyFailureProtection(t *testing.T) {
 	s.persisted[testKey] = observedMigrationDescriptor(t)
 	s.writeResult = bad
 	err = applyServicePolicy(s, testKey, mustServicePolicy(t, testServiceName))
-	if !errors.Is(err, errPostWriteVerification) || len(s.writes) != 1 || len(s.deleted) != 0 || len(s.creates) != 0 {
+	if !errors.Is(err, ErrPostWriteVerification) || len(s.writes) != 1 || len(s.deleted) != 0 || len(s.creates) != 0 {
 		t.Fatalf("post-write behavior changed: %v", err)
 	}
 	requireDescriptorDiagnostic(t, err, bad)

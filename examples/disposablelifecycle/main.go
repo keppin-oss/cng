@@ -7,8 +7,10 @@
 // invocation. It never accepts or deletes an arbitrary production key name and
 // performs no wildcard/prefix deletion.
 //
-// Machine-scoped key creation and deletion need a Windows context authorized
-// for those operations. An elevated PowerShell is one way to run this example:
+// The key is created with LoadOrCreateWithPolicy and PolicyServiceSigner, which
+// requires a privileged caller (SYSTEM or an elevated Administrator); deletion
+// needs a Windows context authorized for it. An elevated PowerShell is one way
+// to run this example:
 //
 //	go run ./examples/disposablelifecycle
 package main
@@ -35,10 +37,10 @@ func run() error {
 	// only this name.
 	name := fmt.Sprintf("Example.CNG.Disposable.%d", time.Now().UnixNano())
 
-	// The process must be authorized if a machine-scoped key is created.
-	signer, err := windowscng.LoadOrCreate(name)
+	// Creation needs a privileged caller (SYSTEM or an elevated Administrator).
+	signer, err := windowscng.LoadOrCreateWithPolicy(name, windowscng.PolicyServiceSigner)
 	if err != nil {
-		return fmt.Errorf("LoadOrCreate: %w", err)
+		return fmt.Errorf("LoadOrCreateWithPolicy: %w", err)
 	}
 	// Immediate cleanup registration. Close is idempotent and releases handles
 	// but does not delete the persisted key; the explicit Close below is the

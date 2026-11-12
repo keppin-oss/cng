@@ -263,8 +263,8 @@ func TestApplyServicePolicy(t *testing.T) {
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.writeResult = serviceSIDDescriptor(t, other.SID(), genericRead|genericExecute)
 		err := applyServicePolicy(s, testKey, p)
-		if !errors.Is(err, errPostWriteVerification) {
-			t.Fatalf("err = %v, want errPostWriteVerification", err)
+		if !errors.Is(err, ErrPostWriteVerification) {
+			t.Fatalf("err = %v, want ErrPostWriteVerification", err)
 		}
 		if len(s.writes) != 1 {
 			t.Fatalf("writes = %v, want exactly one (no rollback)", s.writes)
@@ -276,8 +276,8 @@ func TestApplyServicePolicy(t *testing.T) {
 		s.privileged = true
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.reopenResult = serviceSignerDescriptor(t, genericRead)
-		if err := applyServicePolicy(s, testKey, p); !errors.Is(err, errPostWriteVerification) {
-			t.Fatalf("err = %v, want errPostWriteVerification", err)
+		if err := applyServicePolicy(s, testKey, p); !errors.Is(err, ErrPostWriteVerification) {
+			t.Fatalf("err = %v, want ErrPostWriteVerification", err)
 		}
 		assertHandlesReleased(t, s)
 	})

@@ -22,10 +22,10 @@ func TestDeleteTargetsExactCallerSuppliedKeyName(t *testing.T) {
 
 // TestIsKeyNotFound classification.
 func TestIsKeyNotFound(t *testing.T) {
-	if !IsKeyNotFound(nteNotFound) {
+	if !IsKeyNotFound(uintptr(NTENotFound)) {
 		t.Error("NTE_NOT_FOUND should classify as not-found")
 	}
-	if !IsKeyNotFound(nteBadKeyset) {
+	if !IsKeyNotFound(uintptr(NTEBadKeyset)) {
 		t.Error("NTE_BAD_KEYSET should classify as not-found")
 	}
 	if IsKeyNotFound(0x80090010) { // NTE_PERM

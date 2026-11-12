@@ -37,13 +37,15 @@ type fakeStore struct {
 	writeResult []byte
 	// reopenResult, if set, is what a second open of the key observes.
 	reopenResult []byte
-	exportErr    error
-	pubErr       error
-	setErr       error
-	sdErr        error
-	deleteErr    error // failure of deleteCreated; the key then persists
-	sdReads      int
-	events       []string // descriptor read/delete ordering, no native operations
+	// reopenErr, if set, is what a second open of the key returns.
+	reopenErr error
+	exportErr error
+	pubErr    error
+	setErr    error
+	sdErr     error
+	deleteErr error // failure of deleteCreated; the key then persists
+	sdReads   int
+	events    []string // descriptor read/delete ordering, no native operations
 
 	// signerErr, if set, makes signer() fail after checkKeyPolicy succeeded
 	// (the second public-key export failing). Like nativeKey.signer, a failed
@@ -77,6 +79,9 @@ func (s *fakeStore) open(name string) (storedKey, error) {
 	sd, ok := s.persisted[name]
 	if !ok {
 		return nil, fmt.Errorf("key %q: %w", name, ErrKeyNotFound)
+	}
+	if s.opens > 1 && s.reopenErr != nil {
+		return nil, s.reopenErr
 	}
 	if s.opens > 1 && s.reopenResult != nil {
 		sd = s.reopenResult
@@ -680,8 +685,8 @@ func TestApplyPolicy(t *testing.T) {
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.writeResult = buildDescriptor(t, protectedControl, allow(genericAll, sidSYSTEM), allow(0x001F0003, sidAdministrators))
 		err := applyPolicy(s, testKey, PolicyPrivilegedOnly)
-		if !errors.Is(err, errPostWriteVerification) {
-			t.Fatalf("err = %v, want errPostWriteVerification", err)
+		if !errors.Is(err, ErrPostWriteVerification) {
+			t.Fatalf("err = %v, want ErrPostWriteVerification", err)
 		}
 		if len(s.writes) != 1 {
 			t.Fatalf("writes = %v, want exactly one (no rollback)", s.writes)
@@ -694,8 +699,8 @@ func TestApplyPolicy(t *testing.T) {
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.reopenResult = serviceSignerDescriptor(t, genericRead)
 		err := applyPolicy(s, testKey, PolicyPrivilegedOnly)
-		if !errors.Is(err, errPostWriteVerification) {
-			t.Fatalf("err = %v, want errPostWriteVerification", err)
+		if !errors.Is(err, ErrPostWriteVerification) {
+			t.Fatalf("err = %v, want ErrPostWriteVerification", err)
 		}
 		if len(s.writes) != 1 {
 			t.Fatalf("writes = %v, want exactly one (no rollback)", s.writes)

@@ -1,8 +1,10 @@
 //go:build windows
 
 // Command openexisting demonstrates opening an exact existing machine-scoped
-// key with windowscng.Open and correct ErrKeyNotFound handling. Open never
-// creates a replacement key.
+// key with windowscng.OpenWithPolicy and PolicyServiceSigner, with correct
+// ErrKeyNotFound and ErrPolicyMismatch handling. OpenWithPolicy never creates
+// a replacement key and never modifies the key; it rejects a key whose DACL is
+// not exactly the service-signer policy.
 //
 // Authorization to open/sign an existing key is governed by the persisted DACL
 // and is not equivalent to permission to create/delete. Those operations need
@@ -39,12 +41,15 @@ func run() error {
 		"exact machine-scoped CNG key name to open (never created if absent)")
 	flag.Parse()
 
-	signer, err := windowscng.Open(*name)
+	signer, err := windowscng.OpenWithPolicy(*name, windowscng.PolicyServiceSigner)
 	if err != nil {
-		if errors.Is(err, windowscng.ErrKeyNotFound) {
-			return fmt.Errorf("key %q was not found or is not accessible to this caller; Open never creates a replacement (%w)", *name, err)
+		switch {
+		case errors.Is(err, windowscng.ErrKeyNotFound):
+			return fmt.Errorf("key %q was not found or is not accessible to this caller; OpenWithPolicy never creates a replacement (%w)", *name, err)
+		case errors.Is(err, windowscng.ErrPolicyMismatch):
+			return fmt.Errorf("key %q exists but its DACL is not exactly the service-signer policy; it was not modified (%w)", *name, err)
 		}
-		return fmt.Errorf("Open: %w", err)
+		return fmt.Errorf("OpenWithPolicy: %w", err)
 	}
 	// Register cleanup immediately after successful acquisition.
 	defer signer.Close()

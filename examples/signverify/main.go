@@ -1,12 +1,15 @@
 //go:build windows
 
 // Command signverify demonstrates the shortest correct consumer flow against a
-// disposable machine-scoped key: acquire a signer with LoadOrCreate, register
-// cleanup immediately, sign through crypto.Signer, and verify using public
-// material only. The private key is never exported or materialized.
+// disposable machine-scoped key: acquire a signer with LoadOrCreateWithPolicy
+// and PolicyServiceSigner (a key LOCAL SERVICE can use, with its DACL verified
+// exactly), register cleanup immediately, sign through crypto.Signer, and
+// verify using public material only. The private key is never exported or
+// materialized.
 //
-// LoadOrCreate may create a machine-scoped CNG key and needs a Windows context
-// authorized for that operation. An elevated PowerShell is one way to run it:
+// Creating the key requires a privileged caller (SYSTEM or an elevated
+// Administrator); otherwise the call returns ErrPrivilegeRequired. An elevated
+// PowerShell is one way to run it:
 //
 //	go run ./examples/signverify
 package main
@@ -32,10 +35,11 @@ func main() {
 }
 
 func run() error {
-	// The process must be authorized if a machine-scoped key is created.
-	signer, err := windowscng.LoadOrCreate(exampleKeyName)
+	// Creation needs a privileged caller; an existing key must hold exactly the
+	// service-signer DACL.
+	signer, err := windowscng.LoadOrCreateWithPolicy(exampleKeyName, windowscng.PolicyServiceSigner)
 	if err != nil {
-		return fmt.Errorf("LoadOrCreate: %w", err)
+		return fmt.Errorf("LoadOrCreateWithPolicy: %w", err)
 	}
 	// Register cleanup immediately, before any later fallible operation.
 	// Close releases handles but does not delete the persisted key.

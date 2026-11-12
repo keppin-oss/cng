@@ -188,35 +188,108 @@ func checkModulePath(path, name, dir string) error {
 	return nil
 }
 
+// maxPathChars is the largest buffer, in UTF-16 elements, that systemDirectory
+// and moduleFileName allocate. It is a limit of this package, matching the
+// longest Windows path, not a guarantee of either API.
+const maxPathChars = 32768
+
+// lengthCall runs GetSystemDirectoryW or GetModuleFileNameW into buf, whose
+// length is the capacity, and returns the raw return register of Proc.Call and
+// its last error. The register is returned unnormalized on purpose: the
+// returned length is a 32-bit UINT/DWORD, and only the callers read it, as
+// uint32, so that the normalization is tested with dirty upper bits.
+type lengthCall func(buf []uint16) (raw uintptr, callErr error)
+
+// nativeGetSystemDirectory is the production lengthCall for
+// GetSystemDirectoryW. The Go pointer is converted inside the Call argument
+// list, as the pointer-lifetime contract of Proc.Call requires.
+func nativeGetSystemDirectory(buf []uint16) (uintptr, error) {
+	r, _, err := procGetSystemDirectoryW.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return r, err
+}
+
 // systemDirectory returns the Windows system directory (GetSystemDirectoryW).
 func systemDirectory() (string, error) {
+	return systemDirectoryWith(nativeGetSystemDirectory)
+}
+
+// systemDirectoryWith runs the GetSystemDirectoryW loop over call. The return
+// is a 32-bit UINT: 0 is a failure; a value below the capacity is the number
+// of characters copied, without the terminator; otherwise it is the size
+// required, terminator included, which is always above the capacity. So a
+// value equal to the capacity is inconsistent and is an error, never a retry
+// with the same buffer. The buffer grows to the required size, strictly larger
+// at every retry and never beyond maxPathChars. The comparisons are made on
+// uint64, before any conversion to int, so that no value can turn negative on
+// 386.
+func systemDirectoryWith(call lengthCall) (string, error) {
 	buf := make([]uint16, syscall.MAX_PATH)
 	for {
-		n, _, err := procGetSystemDirectoryW.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		raw, err := call(buf)
+		n := uint32(raw)
 		if n == 0 {
+			if err == nil {
+				err = errors.New("returned 0")
+			}
 			return "", fmt.Errorf("windowscng: GetSystemDirectoryW: %w", err)
 		}
-		if int(n) < len(buf) {
+		size := uint64(len(buf))
+		switch {
+		case uint64(n) < size:
 			return syscall.UTF16ToString(buf[:n]), nil
+		case uint64(n) == size:
+			return "", fmt.Errorf("windowscng: GetSystemDirectoryW: returned length %d equal to the buffer size, which the API never reports", n)
+		case uint64(n) > maxPathChars:
+			return "", fmt.Errorf("windowscng: GetSystemDirectoryW: required size %d exceeds the limit of %d characters", n, maxPathChars)
 		}
 		buf = make([]uint16, n)
 	}
 }
 
+// nativeGetModuleFileName returns the production lengthCall for
+// GetModuleFileNameW on the module h.
+func nativeGetModuleFileName(h syscall.Handle) lengthCall {
+	return func(buf []uint16) (uintptr, error) {
+		r, _, err := procGetModuleFileNameW.Call(uintptr(h), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		return r, err
+	}
+}
+
 // moduleFileName returns the full path of the file the module h was loaded from.
 func moduleFileName(h syscall.Handle) (string, error) {
+	return moduleFileNameWith(nativeGetModuleFileName(h))
+}
+
+// moduleFileNameWith runs the GetModuleFileNameW loop over call. The return is
+// a 32-bit DWORD: 0 is a failure, returned with its last error; a value below
+// the capacity is the number of characters copied, without the terminator; a
+// value equal to the capacity means that the path was truncated. The buffer
+// then doubles, up to maxPathChars, and a path that does not fit there returns
+// ERROR_INSUFFICIENT_BUFFER. A value above the capacity is outside the
+// contract and is an error, never a length to slice with. The branch depends
+// only on the returned value: a stale last error never fails a call that
+// succeeded.
+func moduleFileNameWith(call lengthCall) (string, error) {
 	buf := make([]uint16, syscall.MAX_PATH)
 	for {
-		n, _, err := procGetModuleFileNameW.Call(uintptr(h), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		raw, err := call(buf)
+		n := uint32(raw)
 		if n == 0 {
+			if err == nil {
+				err = errors.New("GetModuleFileNameW returned 0")
+			}
 			return "", err
 		}
-		if int(n) < len(buf) {
+		size := uint64(len(buf))
+		switch {
+		case uint64(n) < size:
 			return syscall.UTF16ToString(buf[:n]), nil
+		case uint64(n) > size:
+			return "", fmt.Errorf("GetModuleFileNameW: returned length %d exceeds the buffer size %d", n, len(buf))
 		}
-		if len(buf) >= 32768 {
+		if len(buf) >= maxPathChars {
 			return "", errorInsufficientBuffer
 		}
-		buf = make([]uint16, 2*len(buf))
+		buf = make([]uint16, min(2*len(buf), maxPathChars))
 	}
 }
