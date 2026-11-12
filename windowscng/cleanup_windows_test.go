@@ -187,7 +187,7 @@ func (o *fakeLegacyOps) openKey(provider uintptr, nameUTF16 *uint16) (uintptr, u
 	}
 	obj := o.byName[utf16PtrToString(nameUTF16)]
 	if obj == nil || !obj.present {
-		return 0, nteNotFound
+		return 0, NTENotFound
 	}
 	return o.newHandle(&fakeLegacyHandle{obj: obj}), 0
 }

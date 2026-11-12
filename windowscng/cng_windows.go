@@ -122,45 +122,12 @@ const msSoftwareKSP = "Microsoft Software Key Storage Provider"
 // ECDSA P-256 signing key.
 const ecdsaP256Algorithm = "ECDSA_P256"
 
-// NTSTATUS/HRESULT values used to classify "key does not exist".
-const (
-	// nteNotFound is NTE_NOT_FOUND (0x8009000D): object was not found.
-	nteNotFound = 0x8009000D
-	// nteBadKeyset is NTE_BAD_KEYSET (0x80090016): the keyset does not exist.
-	nteBadKeyset = 0x80090016
-)
-
 // deleteKeyOpenFlags are the NCryptOpenKey flags used when opening a key for
 // deletion: machine scope with silent operation. No create fallback is used.
 const deleteKeyOpenFlags = ncryptMachineKeyFlag | ncryptSilentFlag
 
 // openKeyFlags are the NCryptOpenKey flags used when opening an existing key.
 const openKeyFlags = ncryptMachineKeyFlag | ncryptSilentFlag
-
-// ErrKeyNotFound indicates that the native open of the exact persisted CNG key
-// reported NTE_NOT_FOUND or NTE_BAD_KEYSET: the key was not found OR is not
-// accessible to the caller. The Microsoft Software KSP has been observed to
-// report NTE_BAD_KEYSET to a caller that the key's DACL does not grant, so the
-// error alone does not prove that the key is absent. The wrapping error keeps
-// the native HRESULT. Not even a caller that the expected DACL would grant can
-// read it as proof of absence, and it must never by itself trigger an
-// automatic reset, regeneration or overwrite of an identity key.
-var ErrKeyNotFound = errors.New("windowscng: persisted CNG key not found or not accessible")
-
-// ErrCleanupFailed indicates that a call failed after creating a new persisted
-// key and that deleting that key also failed: the key created by the call may
-// still exist and must be inspected. It is joined with the original failure.
-// Keys that existed before the call are never deleted on this path.
-var ErrCleanupFailed = errors.New("windowscng: deleting the key created by the failed call also failed; the key may persist")
-
-// IsKeyNotFound reports whether an NCrypt HRESULT is NTE_NOT_FOUND or
-// NTE_BAD_KEYSET, which this package reports as ErrKeyNotFound. It does not
-// distinguish an absent key from one the caller cannot access; it does
-// distinguish them from other failures such as NTE_PERM.
-func IsKeyNotFound(r uintptr) bool {
-	hr := uint32(r)
-	return hr == nteNotFound || hr == nteBadKeyset
-}
 
 // Open opens the existing persisted machine-scoped key named name without
 // creating a replacement. It returns an error wrapping ErrKeyNotFound when the
@@ -263,15 +230,6 @@ func win32BOOLAndCallErr(r, _ uintptr, err error) (bool, error) {
 	return uint32(r) != 0, err
 }
 
-// ncryptStatusError formats a failed NCrypt status as "op: hr=0x<status>",
-// lowercase hex without padding. NCrypt functions return their status as a
-// 32-bit SECURITY_STATUS and do not set the thread's last error, so the error
-// value returned by Proc.Call is deliberately not included: it would show
-// ERROR_SUCCESS or an unrelated stale error.
-func ncryptStatusError(op string, r uint32) error {
-	return fmt.Errorf("%s: hr=0x%x", op, r)
-}
-
 // buildSecurityDescriptor converts an SDDL string into a self-relative
 // security descriptor.
 func buildSecurityDescriptor(sddlString string) ([]byte, error) {
@@ -288,7 +246,7 @@ func buildSecurityDescriptor(sddlString string) ([]byte, error) {
 		uintptr(unsafe.Pointer(&sdSize)),
 	))
 	if !ok {
-		return nil, fmt.Errorf("ConvertStringSecurityDescriptorToSecurityDescriptorW: %v", err)
+		return nil, withCauses(fmt.Sprintf("ConvertStringSecurityDescriptorToSecurityDescriptorW: %v", err), win32Cause(err))
 	}
 	defer procLocalFree.Call(uintptr(sdPtr))
 	out := make([]byte, sdSize)
@@ -307,7 +265,7 @@ func convertStringSid(sidString string) (unsafe.Pointer, error) {
 		uintptr(unsafe.Pointer(&sidPtr)),
 	))
 	if !ok {
-		return nil, fmt.Errorf("ConvertStringSidToSidW(%s): %v", sidString, err)
+		return nil, withCauses(fmt.Sprintf("ConvertStringSidToSidW(%s): %v", sidString, err), win32Cause(err))
 	}
 	return sidPtr, nil
 }
@@ -330,28 +288,29 @@ func verifyDACL(keyHandle uintptr) error {
 	var daclPresent int32
 	var daclDefaulted int32
 	var daclPtr unsafe.Pointer
-	ok := win32BOOL(procGetSecurityDescriptorDacl.Call(
+	// The last error is read only on failure, from the same Proc.Call.
+	ok, callErr := win32BOOLAndCallErr(procGetSecurityDescriptorDacl.Call(
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(unsafe.Pointer(&daclPresent)),
 		uintptr(unsafe.Pointer(&daclPtr)),
 		uintptr(unsafe.Pointer(&daclDefaulted)),
 	))
 	if !ok {
-		return fmt.Errorf("GetSecurityDescriptorDacl failed")
+		return withCauses("GetSecurityDescriptorDacl failed", win32Cause(callErr))
 	}
 	if daclPresent == 0 || daclPtr == nil {
 		return fmt.Errorf("persisted DACL is NULL — key has no access control")
 	}
 
 	var aclInfo aclSizeInfo
-	ok = win32BOOL(procGetAclInformation.Call(
+	ok, callErr = win32BOOLAndCallErr(procGetAclInformation.Call(
 		uintptr(daclPtr),
 		uintptr(unsafe.Pointer(&aclInfo)),
 		uintptr(unsafe.Sizeof(aclInfo)),
 		uintptr(aclSizeInfoClass),
 	))
 	if !ok {
-		return fmt.Errorf("GetAclInformation failed")
+		return withCauses("GetAclInformation failed", win32Cause(callErr))
 	}
 	if aclInfo.AceCount == 0 {
 		return fmt.Errorf("persisted DACL has zero ACEs — key is inaccessible")
@@ -415,12 +374,13 @@ func verifyDACL(keyHandle uintptr) error {
 	var foundSys, foundAdm, foundLS bool
 	for i := uint32(0); i < aclInfo.AceCount; i++ {
 		var acePtr unsafe.Pointer
-		if !win32BOOL(procGetAce.Call(
+		ok, callErr := win32BOOLAndCallErr(procGetAce.Call(
 			uintptr(daclPtr),
 			uintptr(i),
 			uintptr(unsafe.Pointer(&acePtr)),
-		)) {
-			return fmt.Errorf("GetAce(%d) failed", i)
+		))
+		if !ok {
+			return withCauses(fmt.Sprintf("GetAce(%d) failed", i), win32Cause(callErr))
 		}
 
 		ace := (*accessAllowedAce)(acePtr)
@@ -512,7 +472,7 @@ func getSecurityDescriptor(keyHandle uintptr) ([]byte, error) {
 		uintptr(daclSecurityInformation),
 	))
 	if r != 0 {
-		return nil, fmt.Errorf("cannot read persisted security descriptor: hr=0x%x", r)
+		return nil, withCauses(fmt.Sprintf("cannot read persisted security descriptor: hr=0x%x", r), &NCryptError{Op: "NCryptGetProperty", Code: r})
 	}
 	if propLen == 0 {
 		return nil, fmt.Errorf("cannot read persisted security descriptor: reported size 0")
@@ -528,7 +488,7 @@ func getSecurityDescriptor(keyHandle uintptr) ([]byte, error) {
 		uintptr(daclSecurityInformation),
 	))
 	if r != 0 {
-		return nil, fmt.Errorf("NCryptGetProperty(Security Descr): hr=0x%x", r)
+		return nil, ncryptStatusError("NCryptGetProperty(Security Descr)", r)
 	}
 	// Compare as uint64: int(propLen) would turn negative on 32-bit Windows
 	// for sizes >= 0x80000000 and let the slice below panic.
@@ -569,7 +529,7 @@ func verifyExportPolicy(keyHandle uintptr) error {
 		uintptr(ncryptSilentFlag),
 	))
 	if r != 0 {
-		return fmt.Errorf("cannot verify export policy: hr=0x%x", r)
+		return withCauses(fmt.Sprintf("cannot verify export policy: hr=0x%x", r), &NCryptError{Op: "NCryptGetProperty", Code: r})
 	}
 	forbidden := uint32(ncryptAllowExportFlag | ncryptAllowPlaintextExportFlag | ncryptAllowArchivingFlag | ncryptAllowPlaintextArchivingFlag)
 	if actualPolicy&forbidden != 0 {
@@ -595,7 +555,7 @@ func deleteKeyHandle(keyHandle uintptr) error {
 		func(h uintptr) error {
 			r := ncryptStatus(procNCryptDeleteKey.Call(h, 0))
 			if r != 0 {
-				return fmt.Errorf("NCryptDeleteKey: hr=0x%x", r)
+				return ncryptStatusError("NCryptDeleteKey", r)
 			}
 			return nil
 		},
@@ -617,9 +577,22 @@ func deletePersistedKey(keyHandle uintptr) error {
 // pre-existing key is ever deleted, overwritten or regenerated by this path.
 func cleanupCreatedKey(cause error, deleteCreated func() error) error {
 	if err := deleteCreated(); err != nil {
-		return errors.Join(cause, fmt.Errorf("%w: %v", ErrCleanupFailed, err))
+		return errors.Join(cause, fmt.Errorf("%w: %w", ErrCleanupFailed, err))
 	}
 	return fmt.Errorf("%w (the key created by this call was deleted)", cause)
+}
+
+// openKeyStatusError reports a failed NCryptOpenKey of the key name with the
+// existing texts: "key <name>: NCryptOpenKey hr=0x..: <ErrKeyNotFound>" when
+// IsKeyNotFound(r), else "NCryptOpenKey <name><label>: hr=0x..". The status
+// is reachable as an NCryptError with Op "NCryptOpenKey", and the first form
+// also wraps ErrKeyNotFound.
+func openKeyStatusError(name string, r uint32, label string) error {
+	status := &NCryptError{Op: "NCryptOpenKey", Code: r}
+	if IsKeyNotFound(uintptr(r)) {
+		return withCauses(fmt.Sprintf("key %q: NCryptOpenKey hr=0x%x: %v", name, r, ErrKeyNotFound), status, ErrKeyNotFound)
+	}
+	return withCauses(fmt.Sprintf("NCryptOpenKey %q%s: hr=0x%x", name, label, r), status)
 }
 
 // deleteKey deletes exactly one persisted CNG key by its exact name. It never
@@ -650,10 +623,7 @@ func deleteKey(name string) error {
 		uintptr(deleteKeyOpenFlags),
 	))
 	if r != 0 {
-		if IsKeyNotFound(uintptr(r)) {
-			return fmt.Errorf("key %q: NCryptOpenKey hr=0x%x: %w", name, r, ErrKeyNotFound)
-		}
-		return fmt.Errorf("NCryptOpenKey %q (for delete): hr=0x%x", name, r)
+		return openKeyStatusError(name, r, " (for delete)")
 	}
 
 	if err := deleteKeyHandle(keyHandle); err != nil {
@@ -750,10 +720,7 @@ func openKeyWith(ops legacyKeyOps, name string) (Signer, error) {
 	keyHandle, r := ops.openKey(provider, nameUTF16)
 	if r != 0 {
 		ops.free(provider)
-		if IsKeyNotFound(uintptr(r)) {
-			return nil, fmt.Errorf("key %q: NCryptOpenKey hr=0x%x: %w", name, r, ErrKeyNotFound)
-		}
-		return nil, fmt.Errorf("NCryptOpenKey %q: hr=0x%x", name, r)
+		return nil, openKeyStatusError(name, r, "")
 	}
 
 	// Existing keys are security-sensitive state. Revalidate every time before
@@ -838,14 +805,40 @@ func loadOrCreateKeyWith(ops legacyKeyOps, name string) (Signer, error) {
 	return signer, nil
 }
 
-// createPersistedKey creates a new non-exportable, machine-scoped ECDSA P-256
-// key named nameUTF16, sets the DACL in sddl and only then finalizes it. It
-// never sets NCRYPT_OVERWRITE_KEY_FLAG, so an existing key of the same name is
-// not replaced. On failure it releases or deletes the key it created and
-// returns a zero handle; if that delete also fails the error wraps
-// ErrCleanupFailed and the key may persist. The provider handle always remains
-// owned by the caller. On success the caller owns the returned key handle.
-func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintptr, error) {
+// createKeyNative is the set of native operations performed by
+// createPersistedKey. Production code uses nativeCreateKeyOps; unit tests
+// inject a simulated backend so that the status handling, the rollback after a
+// failed NCryptFinalizeKey and the key handle ownership can be verified
+// without touching any real persisted CNG key. No operation looks a key up by
+// name: the rollback only ever acts on the handle returned by the create.
+type createKeyNative interface {
+	// createPersisted runs NCryptCreatePersistedKey for an ECDSA P-256
+	// machine key named nameUTF16, without NCRYPT_OVERWRITE_KEY_FLAG, and
+	// returns the new key handle and the native 32-bit status.
+	createPersisted(provider uintptr, nameUTF16 *uint16) (keyHandle uintptr, hr uint32)
+	// setExportPolicyNone sets the "Export Policy" property to 0.
+	setExportPolicyNone(keyHandle uintptr) (hr uint32)
+	// setSecurityDescriptor builds the descriptor from sddl and writes it to
+	// the not yet finalized key.
+	setSecurityDescriptor(keyHandle uintptr, sddl string) error
+	// finalize runs NCryptFinalizeKey.
+	finalize(keyHandle uintptr) (hr uint32)
+	// deleteKey runs NCryptDeleteKey. Success consumes the handle; on failure
+	// the caller still owns it.
+	deleteKey(keyHandle uintptr) (hr uint32)
+	// free runs NCryptFreeObject on a key handle.
+	free(keyHandle uintptr)
+	// callerPrivileged reports whether the calling thread's token is SYSTEM
+	// or an enabled member of the built-in Administrators group (see
+	// nativeKeyStore.callerPrivileged). It is asked only by
+	// cleanupAfterFinalizeFailure.
+	callerPrivileged() (bool, error)
+}
+
+// nativeCreateKeyOps calls ncrypt.dll and advapi32.dll.
+type nativeCreateKeyOps struct{}
+
+func (nativeCreateKeyOps) createPersisted(provider uintptr, nameUTF16 *uint16) (uintptr, uint32) {
 	var keyHandle uintptr
 	r := ncryptStatus(procNCryptCreatePersistedKey.Call(
 		provider,
@@ -855,22 +848,68 @@ func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintp
 		0,
 		uintptr(ncryptMachineKeyFlag),
 	))
-	if r != 0 {
-		return 0, ncryptStatusError("NCryptCreatePersistedKey", r)
-	}
+	return keyHandle, r
+}
 
+func (nativeCreateKeyOps) setExportPolicyNone(keyHandle uintptr) uint32 {
 	zero := uint32(0)
-	r = ncryptStatus(procNCryptSetProperty.Call(
+	return ncryptStatus(procNCryptSetProperty.Call(
 		keyHandle,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Export Policy"))),
 		uintptr(unsafe.Pointer(&zero)),
 		unsafe.Sizeof(zero),
 		uintptr(ncryptSilentFlag),
 	))
+}
+
+func (nativeCreateKeyOps) setSecurityDescriptor(keyHandle uintptr, sddl string) error {
+	sd, err := buildSecurityDescriptor(sddl)
+	if err != nil {
+		return fmt.Errorf("build security descriptor: %w", err)
+	}
+	if err := setSecurityDescriptor(keyHandle, sd); err != nil {
+		return fmt.Errorf("before finalize: %w", err)
+	}
+	return nil
+}
+
+func (nativeCreateKeyOps) finalize(keyHandle uintptr) uint32 {
+	return ncryptStatus(procNCryptFinalizeKey.Call(keyHandle, 0))
+}
+
+func (nativeCreateKeyOps) deleteKey(keyHandle uintptr) uint32 {
+	return ncryptStatus(procNCryptDeleteKey.Call(keyHandle, 0))
+}
+
+func (nativeCreateKeyOps) free(keyHandle uintptr) { procNCryptFreeObject.Call(keyHandle) }
+
+func (nativeCreateKeyOps) callerPrivileged() (bool, error) {
+	return nativeKeyStore{}.callerPrivileged()
+}
+
+// createPersistedKey creates a new non-exportable, machine-scoped ECDSA P-256
+// key named nameUTF16, sets the DACL in sddl and only then finalizes it. It
+// never sets NCRYPT_OVERWRITE_KEY_FLAG, so an existing key of the same name is
+// not replaced. On failure it releases or deletes the key it created and
+// returns a zero handle; see cleanupAfterFinalizeFailure for when a failed
+// rollback wraps ErrCleanupFailed. The provider handle always remains owned by
+// the caller. On success the caller owns the returned key handle.
+func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintptr, error) {
+	return createPersistedKeyWith(nativeCreateKeyOps{}, provider, nameUTF16, sddl)
+}
+
+func createPersistedKeyWith(ops createKeyNative, provider uintptr, nameUTF16 *uint16, sddl string) (uintptr, error) {
+	keyHandle, r := ops.createPersisted(provider, nameUTF16)
 	if r != 0 {
+		// Nothing was created by this call; a key of the same name that
+		// already exists is reported here and is never touched.
+		return 0, ncryptStatusError("NCryptCreatePersistedKey", r)
+	}
+
+	if r := ops.setExportPolicyNone(keyHandle); r != 0 {
 		// Not finalized, therefore not persisted: releasing the handle is the
 		// whole cleanup.
-		procNCryptFreeObject.Call(keyHandle)
+		ops.free(keyHandle)
 		return 0, ncryptStatusError("set export policy", r)
 	}
 
@@ -881,21 +920,74 @@ func createPersistedKey(provider uintptr, nameUTF16 *uint16, sddl string) (uintp
 	// cleanup. The callers validate the persisted DACL before returning a
 	// signer, so a provider that did not apply it fails closed and the key is
 	// deleted.
-	sd, err := buildSecurityDescriptor(sddl)
-	if err != nil {
-		procNCryptFreeObject.Call(keyHandle)
-		return 0, fmt.Errorf("build security descriptor: %w", err)
-	}
-	if err := setSecurityDescriptor(keyHandle, sd); err != nil {
-		procNCryptFreeObject.Call(keyHandle)
-		return 0, fmt.Errorf("before finalize: %w", err)
+	if err := ops.setSecurityDescriptor(keyHandle, sddl); err != nil {
+		ops.free(keyHandle)
+		return 0, err
 	}
 
-	r = ncryptStatus(procNCryptFinalizeKey.Call(keyHandle, 0))
-	if r != 0 {
-		return 0, cleanupCreatedKey(ncryptStatusError("NCryptFinalizeKey", r), func() error { return deletePersistedKey(keyHandle) })
+	if r := ops.finalize(keyHandle); r != 0 {
+		return 0, cleanupAfterFinalizeFailure(r, func() uint32 {
+			// Same handle contract as deletePersistedKey: success consumes
+			// the handle, failure leaves it to be freed exactly once.
+			d := ops.deleteKey(keyHandle)
+			if d != 0 {
+				ops.free(keyHandle)
+			}
+			return d
+		}, ops.callerPrivileged)
 	}
 	return keyHandle, nil
+}
+
+// finalizeFailureLeftNothingPersisted reports whether the pair of native
+// statuses observed on one handle shows that a key created by
+// createPersistedKey was never persisted, so that the failed rollback delete
+// is not a cleanup failure. It is deliberately narrow and holds only on the
+// path of createPersistedKey: Microsoft Software KSP, a handle created by the
+// same call without NCRYPT_OVERWRITE_KEY_FLAG, NCryptFinalizeKey denied with
+// NTE_PERM and NCryptDeleteKey on that same, never finalized handle reporting
+// NTE_BAD_KEYSET. NTE_BAD_KEYSET is not treated as absence anywhere else: on
+// an opened or finalized key it can also mean "not accessible" (see
+// ErrKeyNotFound). Every other combination is reported as ErrCleanupFailed.
+// cleanupAfterFinalizeFailure further requires a non-privileged caller.
+func finalizeFailureLeftNothingPersisted(finalizeStatus, deleteStatus uint32) bool {
+	return finalizeStatus == NTEPerm && deleteStatus == NTEBadKeyset
+}
+
+// cleanupAfterFinalizeFailure rolls back a key whose NCryptFinalizeKey failed
+// with finalizeStatus. deleteCreated deletes the key through the handle
+// returned by the create, never by name, and returns the native
+// NCryptDeleteKey status. The finalize failure is always the reported cause:
+//   - delete succeeded: the cause, noting that the key was deleted;
+//   - the statuses match finalizeFailureLeftNothingPersisted and
+//     callerPrivileged reports a non-privileged caller: the cause, noting that
+//     the key was not persisted (it is not claimed to be deleted) and the
+//     delete status, without ErrCleanupFailed;
+//   - any other delete failure: the cause joined with ErrCleanupFailed and
+//     the delete status, because the key may persist.
+//
+// The non-privileged condition is the case verified natively: an
+// Administrator with a UAC-filtered token. For a privileged caller, NTE_PERM
+// from the finalize has another, unobserved reason, and a privilege check
+// that fails counts as privileged: both stay ErrCleanupFailed (fail closed).
+// callerPrivileged is asked only when the statuses match.
+//
+// Nothing is retried. The paths after a successful finalize keep using
+// cleanupCreatedKey, which reports every failed delete as ErrCleanupFailed.
+func cleanupAfterFinalizeFailure(finalizeStatus uint32, deleteCreated func() uint32, callerPrivileged func() (bool, error)) error {
+	cause := ncryptStatusError("NCryptFinalizeKey", finalizeStatus)
+	deleteStatus := deleteCreated()
+	if deleteStatus != 0 && finalizeFailureLeftNothingPersisted(finalizeStatus, deleteStatus) {
+		if privileged, err := callerPrivileged(); err == nil && !privileged {
+			return fmt.Errorf("%w (the key created by this call was not persisted; %w on its unfinalized handle)", cause, ncryptStatusError("NCryptDeleteKey", deleteStatus))
+		}
+	}
+	return cleanupCreatedKey(cause, func() error {
+		if deleteStatus != 0 {
+			return ncryptStatusError("NCryptDeleteKey", deleteStatus)
+		}
+		return nil
+	})
 }
 
 // errSignerClosed is returned by Sign on a closed signer: always once Close
@@ -1039,13 +1131,13 @@ func (s *cngSigner) Close() error {
 	var errs []error
 	if s.key != 0 {
 		if r := native.freeObject(s.key); r != 0 {
-			errs = append(errs, fmt.Errorf("NCryptFreeObject (key %s): hr=0x%x", s.name, r))
+			errs = append(errs, withCauses(fmt.Sprintf("NCryptFreeObject (key %s): hr=0x%x", s.name, r), &NCryptError{Op: "NCryptFreeObject", Code: r}))
 		}
 		s.key = 0
 	}
 	if s.provider != 0 {
 		if r := native.freeObject(s.provider); r != 0 {
-			errs = append(errs, fmt.Errorf("NCryptFreeObject (provider): hr=0x%x", r))
+			errs = append(errs, withCauses(fmt.Sprintf("NCryptFreeObject (provider): hr=0x%x", r), &NCryptError{Op: "NCryptFreeObject", Code: r}))
 		}
 		s.provider = 0
 	}
@@ -1093,7 +1185,7 @@ func exportPublicKey(key uintptr) (*ecdsa.PublicKey, error) {
 func exportPublicKeyWith(key uintptr, export ncryptExportFunc) (*ecdsa.PublicKey, error) {
 	var queried uint32
 	if r := export(key, nil, &queried); r != 0 {
-		return nil, fmt.Errorf("NCryptExportKey (query size): hr=0x%x", r)
+		return nil, ncryptStatusError("NCryptExportKey (query size)", r)
 	}
 	if queried == 0 {
 		return nil, fmt.Errorf("NCryptExportKey (query size): reported size 0")
@@ -1102,7 +1194,7 @@ func exportPublicKeyWith(key uintptr, export ncryptExportFunc) (*ecdsa.PublicKey
 	blob := make([]byte, queried)
 	var written uint32
 	if r := export(key, blob, &written); r != 0 {
-		return nil, fmt.Errorf("NCryptExportKey: hr=0x%x", r)
+		return nil, ncryptStatusError("NCryptExportKey", r)
 	}
 	if written == 0 {
 		return nil, fmt.Errorf("NCryptExportKey: reported 0 bytes written")

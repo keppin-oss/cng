@@ -64,14 +64,13 @@ func LoadOrCreateWithPolicy(name string, policy Policy) (Signer, error) {
 // After writing, the DACL is read back both from the open handle and from a
 // freshly opened handle. If either read-back does not match, an error is
 // returned and the key is NOT rolled back (rolling back would widen access);
-// its persisted DACL must then be inspected manually.
+// its persisted DACL must then be inspected manually. Every failure after the
+// write wraps ErrPostWriteVerification and no other sentinel of this package:
+// an error that is ErrPolicyMismatch or ErrKeyNotFound always means that the
+// DACL was not written.
 func ApplyPolicy(name string, policy Policy) error {
 	return applyPolicy(nativeKeyStore{}, name, policy)
 }
-
-// errPostWriteVerification marks a DACL write whose read-back did not confirm
-// the requested state.
-var errPostWriteVerification = errors.New("windowscng: post-write DACL verification failed; persisted state is unverified and was not rolled back")
 
 // keyStore is the seam between the policy engine and native CNG. The native
 // implementation is nativeKeyStore; unit tests substitute a fake.
@@ -145,7 +144,9 @@ func LoadOrCreateForService(name string, policy ServicePolicy) (Signer, error) {
 //
 // Any other state, including privileged-only (that would widen access) or a
 // service-sid DACL for a different service, returns ErrPolicyMismatch without
-// modifying the key. Post-write verification is as for ApplyPolicy.
+// modifying the key. Post-write verification is as for ApplyPolicy: every
+// failure after the write wraps ErrPostWriteVerification and no other sentinel
+// of this package.
 func ApplyServicePolicy(name string, policy ServicePolicy) error {
 	return applyServicePolicy(nativeKeyStore{}, name, policy)
 }
@@ -195,7 +196,7 @@ func transitionAllowed(current daclState, want policySpec) bool {
 func requirePrivilege(ks keyStore) error {
 	ok, err := ks.callerPrivileged()
 	if err != nil {
-		return fmt.Errorf("%w: privilege check failed: %v", ErrPrivilegeRequired, err)
+		return fmt.Errorf("%w: privilege check failed: %w", ErrPrivilegeRequired, err)
 	}
 	if !ok {
 		return ErrPrivilegeRequired
@@ -300,7 +301,7 @@ func loadOrCreateSpec(ks keyStore, name string, s policySpec) (Signer, error) {
 	}
 	if s.privilegedOpen && !privileged {
 		if privErr != nil {
-			return nil, fmt.Errorf("%w: privilege check failed: %v", ErrPrivilegeRequired, privErr)
+			return nil, fmt.Errorf("%w: privilege check failed: %w", ErrPrivilegeRequired, privErr)
 		}
 		return nil, ErrPrivilegeRequired
 	}
@@ -394,17 +395,21 @@ func applySpec(ks keyStore, name string, want policySpec) error {
 	}
 
 	// Read back from the same handle, then from a fresh handle so that the
-	// persisted state, not only the handle's view, is confirmed.
+	// persisted state, not only the handle's view, is confirmed. From here on
+	// the DACL has been written: the error wraps ErrPostWriteVerification and
+	// keeps only the native causes, never a sentinel of this package such as
+	// ErrPolicyMismatch ("the key was not modified") or ErrKeyNotFound, whose
+	// meaning would contradict it. The text is unchanged.
 	if err := checkDACLState(k, want); err != nil {
-		return fmt.Errorf("key %q: %w: read-back on open handle: %v", name, errPostWriteVerification, err)
+		return fmt.Errorf("key %q: %w: read-back on open handle: %w", name, ErrPostWriteVerification, nativeCausesOnly(err))
 	}
 	fresh, err := ks.open(name)
 	if err != nil {
-		return fmt.Errorf("key %q: %w: reopen: %v", name, errPostWriteVerification, err)
+		return fmt.Errorf("key %q: %w: reopen: %w", name, ErrPostWriteVerification, nativeCausesOnly(err))
 	}
 	defer fresh.close()
 	if err := checkDACLState(fresh, want); err != nil {
-		return fmt.Errorf("key %q: %w: read-back on fresh handle: %v", name, errPostWriteVerification, err)
+		return fmt.Errorf("key %q: %w: read-back on fresh handle: %w", name, ErrPostWriteVerification, nativeCausesOnly(err))
 	}
 	return nil
 }
@@ -441,7 +446,7 @@ func checkTokenMembership(sidString string) (bool, error) {
 	var member int32
 	ok, callErr := win32BOOLAndCallErr(procCheckTokenMembership.Call(0, uintptr(sid), uintptr(unsafe.Pointer(&member))))
 	if !ok {
-		return false, fmt.Errorf("CheckTokenMembership(%s): %v", sidString, callErr)
+		return false, withCauses(fmt.Sprintf("CheckTokenMembership(%s): %v", sidString, callErr), win32Cause(callErr))
 	}
 	return member != 0, nil
 }
@@ -466,10 +471,7 @@ func (nativeKeyStore) open(name string) (storedKey, error) {
 	))
 	if r != 0 {
 		procNCryptFreeObject.Call(provider)
-		if IsKeyNotFound(uintptr(r)) {
-			return nil, fmt.Errorf("key %q: NCryptOpenKey hr=0x%x: %w", name, r, ErrKeyNotFound)
-		}
-		return nil, fmt.Errorf("NCryptOpenKey %q: hr=0x%x", name, r)
+		return nil, openKeyStatusError(name, r, "")
 	}
 	return &nativeKey{provider: provider, key: keyHandle, name: name}, nil
 }

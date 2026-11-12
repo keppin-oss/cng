@@ -66,9 +66,9 @@ const (
 	returnIgnored
 	// returnFullWidth is a handle or pointer that uses the whole register.
 	returnFullWidth
-	// returnLength32Tracked is a 32-bit length whose normalization is
-	// tracked as separate work. Only direct calls are allowed.
-	returnLength32Tracked
+	// returnLength32Raw is a 32-bit length (UINT or DWORD) handed raw to a
+	// loop that normalizes it; see lengthSeams.
+	returnLength32Raw
 )
 
 // nativeProcReturns classifies every native procedure of the package by the
@@ -100,8 +100,8 @@ var nativeProcReturns = map[string]nativeReturn{
 
 	"procLoadLibraryExW": returnFullWidth,
 
-	"procGetModuleFileNameW":  returnLength32Tracked,
-	"procGetSystemDirectoryW": returnLength32Tracked,
+	"procGetModuleFileNameW":  returnLength32Raw,
+	"procGetSystemDirectoryW": returnLength32Raw,
 }
 
 var (
@@ -254,8 +254,32 @@ func checkNativeUse(id *ast.Ident, kind nativeReturn, stack []ast.Node) string {
 		if !discarded() {
 			return "result must not be used"
 		}
-	case returnLength32Tracked:
-		// Direct call only; normalization is tracked separately.
+	case returnLength32Raw:
+		// The raw register goes only from the native seam to the loop that
+		// normalizes it: the call must be the value of an assignment inside
+		// the seam named in lengthSeams.
+		if _, ok := parent(3).(*ast.AssignStmt); !ok {
+			return "result is not assigned in its native seam"
+		}
+		seam := ""
+		for i := len(stack) - 1; i >= 0; i-- {
+			if fd, ok := stack[i].(*ast.FuncDecl); ok {
+				seam = fd.Name.Name
+				break
+			}
+		}
+		if seam != lengthSeams[id.Name] {
+			return "is called outside its native seam " + lengthSeams[id.Name] + ", whose callers normalize the length to uint32"
+		}
 	}
 	return ""
+}
+
+// lengthSeams names, for each procedure returning a 32-bit length, the only
+// function that may call it. That function hands the raw register to a loop
+// (systemDirectoryWith, moduleFileNameWith) that reads it as uint32 and whose
+// tests inject dirty upper bits.
+var lengthSeams = map[string]string{
+	"procGetSystemDirectoryW": "nativeGetSystemDirectory",
+	"procGetModuleFileNameW":  "nativeGetModuleFileName",
 }

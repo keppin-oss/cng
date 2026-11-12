@@ -107,7 +107,7 @@ func TestB3ServicePolicyEngine(t *testing.T) {
 	s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 	s.writeResult = serviceSIDDescriptor(t, p.SID(), 0x801600A9)
 	err = applyServicePolicy(s, testKey, p)
-	if !errors.Is(err, errPostWriteVerification) {
+	if !errors.Is(err, ErrPostWriteVerification) {
 		t.Fatalf("unsafe migration accepted: %v", err)
 	}
 	requireDescriptorDiagnostic(t, err, s.writeResult)
@@ -174,7 +174,7 @@ func TestPostWriteDiagnosticNoRollback(t *testing.T) {
 			s.writeResult = bad
 		}
 		err := applyServicePolicy(s, testKey, p)
-		if !errors.Is(err, errPostWriteVerification) {
+		if !errors.Is(err, ErrPostWriteVerification) {
 			t.Fatalf("post-write sentinel lost: %v", err)
 		}
 		requireDescriptorDiagnostic(t, err, bad)
