@@ -231,3 +231,55 @@ func TestSystemProcCallUnderGCPressure(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestLoadSystemDLLPropagatesModuleVerification loads a real system DLL with a
+// verifier that rejects it: the error is errUntrustedModule, no DLL is
+// returned and the module reference taken by the load is released. With an
+// accepting verifier the DLL is returned. It calls no NCrypt function.
+func TestLoadSystemDLLPropagatesModuleVerification(t *testing.T) {
+	const name = "wtsapi32.dll"
+	namep, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadedBefore := moduleLoaded(namep)
+
+	var seen []syscall.Handle
+	reject := func(h syscall.Handle, n string) error {
+		if n != name {
+			t.Errorf("verifier called for %q, want %q", n, name)
+		}
+		seen = append(seen, h)
+		return errors.Join(errUntrustedModule, errors.New("rejected by the test"))
+	}
+	dll, err := loadSystemDLLWith(name, reject)
+	if dll != nil {
+		dll.Release()
+		t.Fatalf("a DLL was returned although verification failed: %v", dll)
+	}
+	if !errors.Is(err, errUntrustedModule) {
+		t.Fatalf("error = %v, want errUntrustedModule", err)
+	}
+	if len(seen) != 1 || seen[0] == 0 {
+		t.Fatalf("verifier saw handles %v, want exactly one loaded module", seen)
+	}
+	if !loadedBefore {
+		if moduleLoaded(namep) {
+			t.Errorf("%s is still loaded after the rejected load: the handle was not released", name)
+		}
+	}
+
+	accept := func(h syscall.Handle, n string) error { return nil }
+	dll, err = loadSystemDLLWith(name, accept)
+	if err != nil || dll == nil {
+		t.Fatalf("accepting verifier: %v, %v", dll, err)
+	}
+	dll.Release()
+}
+
+// moduleLoaded reports whether the process has the module loaded, without
+// taking a reference.
+func moduleLoaded(name *uint16) bool {
+	h, _, _ := kernel32.NewProc("GetModuleHandleW").Call(uintptr(unsafe.Pointer(name)))
+	return h != 0
+}

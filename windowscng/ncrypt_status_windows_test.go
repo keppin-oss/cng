@@ -3,7 +3,6 @@
 package windowscng
 
 import (
-	"strings"
 	"syscall"
 	"testing"
 	"unsafe"
@@ -57,10 +56,6 @@ func TestNCryptStatusIgnoresUpperBits(t *testing.T) {
 			if got != tc.want || (got != 0) != tc.isErr {
 				t.Fatalf("ncryptStatus(0x%x) = 0x%x, want 0x%x", tc.raw, got, tc.want)
 			}
-			status, callErr := ncryptStatusAndCallErr(uintptr(tc.raw), 0, errno)
-			if status != tc.want || callErr != errno {
-				t.Fatalf("ncryptStatusAndCallErr(0x%x) = 0x%x, %v", tc.raw, status, callErr)
-			}
 			if !tc.isErr {
 				return
 			}
@@ -105,58 +100,4 @@ func TestWin32BOOLIgnoresUpperBits(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestSignNativeStatusOmitsCallError drives both NCryptSignHash failure paths
-// of Sign through the simulated backend, returning a real syscall.Errno as
-// Proc.Call would. The message must be exactly the status, with no trace of
-// the Errno text (localized by Windows) or of its number.
-func TestSignNativeStatusOmitsCallError(t *testing.T) {
-	fx := newSignFixture(t)
-	errnos := []syscall.Errno{
-		0, // ERROR_SUCCESS: "The operation completed successfully."
-		5, // ERROR_ACCESS_DENIED: a stale, unrelated last error
-	}
-	paths := []struct {
-		name  string
-		setup func(f *fakeSignerNative, errno syscall.Errno)
-		want  string
-	}{
-		{"size query", func(f *fakeSignerNative, errno syscall.Errno) {
-			f.sizeHR, f.sizeCallErr = 0x80090010, errno
-		}, "NCryptSignHash (query size): hr=0x80090010"},
-		{"sign", func(f *fakeSignerNative, errno syscall.Errno) {
-			f.signHR, f.signCallErr = 0x80090010, errno
-		}, "NCryptSignHash: hr=0x80090010"},
-	}
-	for _, p := range paths {
-		for _, errno := range errnos {
-			t.Run(p.name+"/"+errnoName(errno), func(t *testing.T) {
-				f := newFakeSignerNative(fx.p1363)
-				p.setup(f, errno)
-				s := newTestSigner(f, fx.pub)
-				defer s.Close()
-				_, err := s.Sign(nil, fx.digest, nil)
-				if err == nil {
-					t.Fatal("Sign succeeded, want the native status error")
-				}
-				if got := err.Error(); got != p.want {
-					t.Fatalf("err = %q, want exactly %q", got, p.want)
-				}
-				if text := errno.Error(); strings.Contains(err.Error(), text) {
-					t.Fatalf("err %q contains the last-error text %q", err, text)
-				}
-			})
-		}
-	}
-}
-
-func errnoName(e syscall.Errno) string {
-	switch e {
-	case 0:
-		return "ERROR_SUCCESS"
-	case 5:
-		return "ERROR_ACCESS_DENIED"
-	}
-	return "errno"
 }

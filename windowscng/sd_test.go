@@ -8,6 +8,13 @@ import (
 	"testing"
 )
 
+// classifyDescriptor is classifyDescriptorSID without the service SID, for
+// tests that only check the state.
+func classifyDescriptor(sd []byte) (daclState, error) {
+	st, _, err := classifyDescriptorSID(sd)
+	return st, err
+}
+
 // testACE describes one ACE for the synthetic descriptor builder.
 type testACE struct {
 	aceType byte

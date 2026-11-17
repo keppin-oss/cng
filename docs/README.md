@@ -206,6 +206,13 @@ if errors.As(err, &ne) && ne.Code == windowscng.NTEPerm {
 
 ## Limits to be aware of
 
+- **Writers must be serialized by the caller.** Provisioning and policy
+  changes on the same key must be serialized by the caller, also across
+  processes. The package does not guarantee tighten-only transitions with
+  concurrent writers: `ApplyPolicy` and `ApplyServicePolicy` read the state
+  and then write, so an overlapping writer can make a stale write succeed
+  (for example a service-SID DACL written over a key that was just tightened
+  to privileged-only, both calls returning `nil`).
 - **"Not found" is ambiguous.** For a caller the DACL does not grant, the KSP
   reports the same status as for a missing key. Never treat `ErrKeyNotFound`
   as proof of absence, and never regenerate an identity key because of it.
@@ -220,13 +227,18 @@ if errors.As(err, &ne) && ne.Code == windowscng.NTEPerm {
   never finalized key reports `NTE_BAD_KEYSET`, the key was not persisted and
   the error is the finalize denial alone. For a privileged caller, or if the
   privilege check fails, and for any other combination, the error still wraps
-  `ErrCleanupFailed`. Only that case was verified natively, on one setup
-  (Windows NT 10.0.26200, Microsoft Software KSP, Administrator with a
-  UAC-filtered token, the `LoadOrCreate` DACL): an elevated caller found the
-  name absent by enumeration and by exact open both before and after the
-  denied finalize, with a temporary control key found by both methods. The
-  check is the opt-in test `TestFinalizeFailureProbe` (build tag
-  `cng_finalize_probe`).
+  `ErrCleanupFailed`. It was verified natively on Windows NT 10.0.26200 with
+  the Microsoft Software KSP, for an Administrator with a UAC-filtered token,
+  a standard user and LOCAL SERVICE (run from a scheduled task), each with the
+  `LoadOrCreate`, privileged-only and service-SID DACLs: in all nine cases
+  finalize was denied with `NTE_PERM`, the delete reported `NTE_BAD_KEYSET`,
+  and an elevated caller found the name absent by enumeration and by exact
+  open both before and after, with a temporary control key found by both
+  methods. Not covered: other Windows builds or KSPs, a caller whose token
+  holds a service SID (a process running as that service), and files left on
+  disk that the KSP does not expose. The check is the opt-in test
+  `TestFinalizeFailureProbe` (build tag `cng_finalize_probe`); see
+  [finalize-probe.md](finalize-probe.md) for the procedure and the matrix.
 - **Open handles are not revoked.** After `ApplyPolicy` or
   `ApplyServicePolicy`, processes that already opened the key keep working;
   restart or reopen consumers.
@@ -259,6 +271,9 @@ go test ./...
 
 The default tests use an in-memory key store and do not create, modify or
 delete any persisted key.
+
+The native smoke tests are opt-in and use real keys: on a test machine, from an elevated context (SYSTEM or an elevated Administrator), run `go test -tags cng_smoke ./windowscng`.
+With `KEPPIN_CNG_SMOKE_REQUIRED=1` an unmet precondition fails the smoke tests instead of skipping them.
 
 ## License
 

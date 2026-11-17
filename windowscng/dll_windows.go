@@ -141,6 +141,12 @@ func loadNativeAPIs() error {
 // directory only, and verifies that the loaded module's file is in that
 // directory.
 func loadSystemDLL(name string) (*syscall.DLL, error) {
+	return loadSystemDLLWith(name, verifyModule)
+}
+
+// loadSystemDLLWith is loadSystemDLL with the module check as a parameter. A
+// module that fails the check is released and no DLL is returned.
+func loadSystemDLLWith(name string, verify func(h syscall.Handle, name string) error) (*syscall.DLL, error) {
 	if name == "" || strings.ContainsAny(name, `\/:`) {
 		return nil, fmt.Errorf("windowscng: %q is not a DLL base name", name)
 	}
@@ -155,7 +161,7 @@ func loadSystemDLL(name string) (*syscall.DLL, error) {
 	if h == 0 {
 		return nil, &syscall.DLLError{Err: callErr, ObjName: name, Msg: fmt.Sprintf("windowscng: load %s from the system directory: %v", name, callErr)}
 	}
-	if err := verifyModule(syscall.Handle(h), name); err != nil {
+	if err := verify(syscall.Handle(h), name); err != nil {
 		procFreeLibrary.Call(h)
 		return nil, err
 	}

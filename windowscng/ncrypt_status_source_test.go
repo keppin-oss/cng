@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -52,7 +53,7 @@ type nativeReturn int
 
 const (
 	// returnNCryptStatus is a 32-bit SECURITY_STATUS: the call must be passed
-	// directly to ncryptStatus or ncryptStatusAndCallErr.
+	// directly to ncryptStatus.
 	returnNCryptStatus nativeReturn = iota
 	// returnNCryptStatusOrCleanup is a SECURITY_STATUS that may also be
 	// discarded: the call goes through ncryptStatus, or is a plain or
@@ -105,7 +106,7 @@ var nativeProcReturns = map[string]nativeReturn{
 }
 
 var (
-	ncryptStatusWrappers = map[string]bool{"ncryptStatus": true, "ncryptStatusAndCallErr": true}
+	ncryptStatusWrappers = map[string]bool{"ncryptStatus": true}
 	win32BOOLWrappers    = map[string]bool{"win32BOOL": true, "win32BOOLAndCallErr": true}
 )
 
@@ -240,7 +241,7 @@ func checkNativeUse(id *ast.Ident, kind nativeReturn, stack []ast.Node) string {
 	switch kind {
 	case returnNCryptStatus:
 		if !wrapped(ncryptStatusWrappers) {
-			return "result is not read through ncryptStatus or ncryptStatusAndCallErr"
+			return "result is not read through ncryptStatus"
 		}
 	case returnNCryptStatusOrCleanup:
 		if !wrapped(ncryptStatusWrappers) && !discarded() {
@@ -282,4 +283,349 @@ func checkNativeUse(id *ast.Ident, kind nativeReturn, stack []ast.Node) string {
 var lengthSeams = map[string]string{
 	"procGetSystemDirectoryW": "nativeGetSystemDirectory",
 	"procGetModuleFileNameW":  "nativeGetModuleFileName",
+}
+
+// The tests below check, on the syntax tree, that the native wrappers without a
+// test seam pass the intended arguments. They parse the non-test sources and
+// never call a native function.
+
+// parseNonTestSources parses every non-test source file of the package.
+func parseNonTestSources(t *testing.T) []*ast.File {
+	t.Helper()
+	names, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	var files []*ast.File
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, f)
+	}
+	if len(files) == 0 {
+		t.Fatal("no source files parsed; the test is not running in the package directory")
+	}
+	return files
+}
+
+// funcKey names a function declaration as "name" or "Receiver.name".
+func funcKey(fd *ast.FuncDecl) string {
+	if fd.Recv == nil || len(fd.Recv.List) == 0 {
+		return fd.Name.Name
+	}
+	typ := fd.Recv.List[0].Type
+	if star, ok := typ.(*ast.StarExpr); ok {
+		typ = star.X
+	}
+	return types.ExprString(typ) + "." + fd.Name.Name
+}
+
+// sourceFuncs returns the function declarations with a body, by funcKey.
+func sourceFuncs(files []*ast.File) map[string]*ast.FuncDecl {
+	out := map[string]*ast.FuncDecl{}
+	for _, f := range files {
+		for _, d := range f.Decls {
+			if fd, ok := d.(*ast.FuncDecl); ok && fd.Body != nil {
+				out[funcKey(fd)] = fd
+			}
+		}
+	}
+	return out
+}
+
+// callsIn returns the calls in body whose callee, printed, is callee.
+func callsIn(body ast.Node, callee string) []*ast.CallExpr {
+	var out []*ast.CallExpr
+	ast.Inspect(body, func(n ast.Node) bool {
+		if c, ok := n.(*ast.CallExpr); ok && types.ExprString(c.Fun) == callee {
+			out = append(out, c)
+		}
+		return true
+	})
+	return out
+}
+
+// isUintptrOf reports whether e is uintptr(arg) with arg printed as want.
+func isUintptrOf(e ast.Expr, want string) bool {
+	c, ok := e.(*ast.CallExpr)
+	return ok && types.ExprString(c.Fun) == "uintptr" && len(c.Args) == 1 && types.ExprString(c.Args[0]) == want
+}
+
+// TestNativeOpenAndCreateFlagsSource checks that the key flags reach the native
+// calls: ncryptOpenKey forwards its flags parameter as the dwFlags argument of
+// NCryptOpenKey, its three callers pass the intended constants (machine scope
+// and silent), and NCryptCreatePersistedKey receives the machine key flag. The
+// values of the constants are tested elsewhere; this tests their use.
+func TestNativeOpenAndCreateFlagsSource(t *testing.T) {
+	files := parseNonTestSources(t)
+	funcs := sourceFuncs(files)
+
+	open, ok := funcs["ncryptOpenKey"]
+	if !ok {
+		t.Fatal("ncryptOpenKey not found")
+	}
+	var params []string
+	for _, f := range open.Type.Params.List {
+		for _, n := range f.Names {
+			params = append(params, n.Name)
+		}
+	}
+	if len(params) != 3 {
+		t.Fatalf("ncryptOpenKey has parameters %v, want provider, name, flags", params)
+	}
+	calls := callsIn(open.Body, "procNCryptOpenKey.Call")
+	if len(calls) != 1 || len(calls[0].Args) != 5 {
+		t.Fatalf("ncryptOpenKey must make one NCryptOpenKey call with 5 arguments, got %d call(s)", len(calls))
+	}
+	if !isUintptrOf(calls[0].Args[4], params[2]) {
+		t.Errorf("ncryptOpenKey passes %s as the NCryptOpenKey dwFlags argument, want uintptr(%s)",
+			types.ExprString(calls[0].Args[4]), params[2])
+	}
+
+	want := map[string]string{
+		"deleteKey":                  "deleteKeyOpenFlags",
+		"nativeLegacyKeyOps.openKey": "openKeyFlags",
+		"nativeKeyStore.open":        "openKeyFlags",
+	}
+	got := map[string]string{}
+	for key, fd := range funcs {
+		for _, c := range callsIn(fd.Body, "ncryptOpenKey") {
+			if len(c.Args) != 3 {
+				t.Errorf("%s: ncryptOpenKey called with %d arguments", key, len(c.Args))
+				continue
+			}
+			got[key] = types.ExprString(c.Args[2])
+		}
+	}
+	for key, flag := range want {
+		if got[key] != flag {
+			t.Errorf("%s passes %q to ncryptOpenKey, want %s", key, got[key], flag)
+		}
+	}
+	for key := range got {
+		if _, ok := want[key]; !ok {
+			t.Errorf("%s calls ncryptOpenKey and is not covered by this test", key)
+		}
+	}
+
+	total := 0
+	for key, fd := range funcs {
+		for _, c := range callsIn(fd.Body, "procNCryptCreatePersistedKey.Call") {
+			total++
+			if len(c.Args) != 6 || !isUintptrOf(c.Args[5], "ncryptMachineKeyFlag") {
+				t.Errorf("%s: NCryptCreatePersistedKey must receive uintptr(ncryptMachineKeyFlag) as dwFlags", key)
+			}
+		}
+	}
+	if total != 1 {
+		t.Errorf("found %d NCryptCreatePersistedKey calls, want 1", total)
+	}
+}
+
+// TestNativeKeyDelegatesToVerifiersSource checks that the policy adapter of a
+// native key delegates to the package verifiers on the key handle, so that
+// ApplyPolicy and the Open functions cannot silently skip them.
+func TestNativeKeyDelegatesToVerifiersSource(t *testing.T) {
+	funcs := sourceFuncs(parseNonTestSources(t))
+	for method, target := range map[string]string{
+		"nativeKey.verifyNonExportable": "verifyExportPolicy",
+		"nativeKey.publicKey":           "exportPublicKey",
+		"nativeKey.securityDescriptor":  "getSecurityDescriptor",
+	} {
+		fd, ok := funcs[method]
+		if !ok {
+			t.Errorf("%s not found", method)
+			continue
+		}
+		recv := fd.Recv.List[0].Names[0].Name
+		var ret *ast.ReturnStmt
+		if len(fd.Body.List) == 1 {
+			ret, _ = fd.Body.List[0].(*ast.ReturnStmt)
+		}
+		var call *ast.CallExpr
+		if ret != nil && len(ret.Results) == 1 {
+			call, _ = ret.Results[0].(*ast.CallExpr)
+		}
+		if call == nil || types.ExprString(call.Fun) != target || len(call.Args) != 1 || types.ExprString(call.Args[0]) != recv+".key" {
+			t.Errorf("%s must be a single return of %s(%s.key)", method, target, recv)
+		}
+	}
+}
+
+// singleReturnCall returns the call of a function whose whole body is one
+// return of one call, and nil otherwise.
+func singleReturnCall(fd *ast.FuncDecl) *ast.CallExpr {
+	if len(fd.Body.List) != 1 {
+		return nil
+	}
+	ret, _ := fd.Body.List[0].(*ast.ReturnStmt)
+	if ret == nil || len(ret.Results) != 1 {
+		return nil
+	}
+	call, _ := ret.Results[0].(*ast.CallExpr)
+	return call
+}
+
+func exprStrings(es []ast.Expr) []string {
+	var out []string
+	for _, e := range es {
+		out = append(out, types.ExprString(e))
+	}
+	return out
+}
+
+// TestNativeWrappersDelegateSource checks that the production wrappers reach
+// the functions that hold the logic with the production inputs, so that the
+// real path cannot silently skip or weaken a verification:
+//
+//	verifyExportPolicy     -> return verifyExportPolicyWith(key, nativeGetProperty)
+//	getSecurityDescriptor  -> return getSecurityDescriptorWith(key, nativeGetProperty)
+//	loadSystemDLL          -> return loadSystemDLLWith(name, verifyModule)
+//	verifyDACL             -> buf, err := getSecurityDescriptor(key); ...; return verifyDescriptorDACL(buf)
+//	validatePersistedKey   -> verifyExportPolicy(key) then verifyDACL(key), each error returned
+func TestNativeWrappersDelegateSource(t *testing.T) {
+	funcs := sourceFuncs(parseNonTestSources(t))
+	get := func(name string) *ast.FuncDecl {
+		fd, ok := funcs[name]
+		if !ok {
+			t.Errorf("%s not found", name)
+		}
+		return fd
+	}
+	param := func(fd *ast.FuncDecl, i int) string {
+		var names []string
+		for _, f := range fd.Type.Params.List {
+			for _, n := range f.Names {
+				names = append(names, n.Name)
+			}
+		}
+		if i >= len(names) {
+			t.Fatalf("%s has %d parameters, want at least %d", fd.Name.Name, len(names), i+1)
+		}
+		return names[i]
+	}
+
+	for _, c := range []struct {
+		fn, target, second string
+	}{
+		{"verifyExportPolicy", "verifyExportPolicyWith", "nativeGetProperty"},
+		{"getSecurityDescriptor", "getSecurityDescriptorWith", "nativeGetProperty"},
+		{"loadSystemDLL", "loadSystemDLLWith", "verifyModule"},
+	} {
+		fd := get(c.fn)
+		if fd == nil {
+			continue
+		}
+		want := []string{param(fd, 0), c.second}
+		call := singleReturnCall(fd)
+		if call == nil || types.ExprString(call.Fun) != c.target || strings.Join(exprStrings(call.Args), ",") != strings.Join(want, ",") {
+			t.Errorf("%s must be a single return of %s(%s)", c.fn, c.target, strings.Join(want, ", "))
+		}
+	}
+
+	// verifyDACL: buf comes from getSecurityDescriptor(key), its error is
+	// returned, and the result is verifyDescriptorDACL(buf).
+	if fd := get("verifyDACL"); fd != nil {
+		key := param(fd, 0)
+		ok := false
+		if n := len(fd.Body.List); n == 3 {
+			as, _ := fd.Body.List[0].(*ast.AssignStmt)
+			ifs, _ := fd.Body.List[1].(*ast.IfStmt)
+			ret, _ := fd.Body.List[2].(*ast.ReturnStmt)
+			if as != nil && len(as.Lhs) == 2 && len(as.Rhs) == 1 && ifs != nil && ret != nil && len(ret.Results) == 1 {
+				buf, errName := types.ExprString(as.Lhs[0]), types.ExprString(as.Lhs[1])
+				read, _ := as.Rhs[0].(*ast.CallExpr)
+				final, _ := ret.Results[0].(*ast.CallExpr)
+				ok = read != nil && types.ExprString(read.Fun) == "getSecurityDescriptor" &&
+					strings.Join(exprStrings(read.Args), ",") == key &&
+					types.ExprString(ifs.Cond) == errName+" != nil" && ifs.Init == nil && ifs.Else == nil &&
+					len(ifs.Body.List) == 1 && returnsOnly(ifs.Body.List[0], errName) &&
+					final != nil && types.ExprString(final.Fun) == "verifyDescriptorDACL" &&
+					strings.Join(exprStrings(final.Args), ",") == buf
+			}
+		}
+		if !ok {
+			t.Error("verifyDACL must read the descriptor with getSecurityDescriptor(key), return its error, and end with return verifyDescriptorDACL(buf)")
+		}
+	}
+
+	// validatePersistedKey: each verifier is called once on the key handle and
+	// its error is returned (the DACL one wrapped with %w).
+	if fd := get("validatePersistedKey"); fd != nil {
+		key := param(fd, 0)
+		stmts := fd.Body.List
+		ok := len(stmts) == 3
+		if ok {
+			ok = checkVerifierIf(stmts[0], "verifyExportPolicy", key, false) &&
+				checkVerifierIf(stmts[1], "verifyDACL", key, true)
+			ret, _ := stmts[2].(*ast.ReturnStmt)
+			ok = ok && ret != nil && len(ret.Results) == 1 && types.ExprString(ret.Results[0]) == "nil"
+		}
+		if !ok {
+			t.Error("validatePersistedKey must be: if err := verifyExportPolicy(key); err != nil { return err }; " +
+				"if err := verifyDACL(key); err != nil { return fmt.Errorf(..., err) }; return nil")
+		}
+	}
+
+	// nativeGetProperty: both NCryptGetProperty calls take the property name
+	// from the property parameter and forward flags as the last argument.
+	if fd := get("nativeGetProperty"); fd != nil {
+		property, flags := param(fd, 1), param(fd, 4)
+		calls := callsIn(fd.Body, "procNCryptGetProperty.Call")
+		if len(calls) != 2 {
+			t.Fatalf("nativeGetProperty makes %d NCryptGetProperty calls, want 2", len(calls))
+		}
+		for i, c := range calls {
+			if len(c.Args) != 6 {
+				t.Errorf("call %d: %d arguments, want 6", i, len(c.Args))
+				continue
+			}
+			if got, want := types.ExprString(c.Args[1]), "uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("+property+")))"; got != want {
+				t.Errorf("call %d: property name argument is %s, want %s", i, got, want)
+			}
+			if !isUintptrOf(c.Args[5], flags) {
+				t.Errorf("call %d: last argument is %s, want uintptr(%s)", i, types.ExprString(c.Args[5]), flags)
+			}
+		}
+	}
+}
+
+// returnsOnly reports whether s is "return name".
+func returnsOnly(s ast.Stmt, name string) bool {
+	ret, _ := s.(*ast.ReturnStmt)
+	return ret != nil && len(ret.Results) == 1 && types.ExprString(ret.Results[0]) == name
+}
+
+// checkVerifierIf reports whether s is `if err := verifier(key); err != nil
+// { return err }`, or with wrapped, a return of fmt.Errorf(..., err).
+func checkVerifierIf(s ast.Stmt, verifier, key string, wrapped bool) bool {
+	ifs, _ := s.(*ast.IfStmt)
+	if ifs == nil || ifs.Else != nil || len(ifs.Body.List) != 1 {
+		return false
+	}
+	as, _ := ifs.Init.(*ast.AssignStmt)
+	if as == nil || len(as.Lhs) != 1 || len(as.Rhs) != 1 || types.ExprString(as.Lhs[0]) != "err" {
+		return false
+	}
+	call, _ := as.Rhs[0].(*ast.CallExpr)
+	if call == nil || types.ExprString(call.Fun) != verifier || strings.Join(exprStrings(call.Args), ",") != key ||
+		types.ExprString(ifs.Cond) != "err != nil" {
+		return false
+	}
+	if !wrapped {
+		return returnsOnly(ifs.Body.List[0], "err")
+	}
+	ret, _ := ifs.Body.List[0].(*ast.ReturnStmt)
+	if ret == nil || len(ret.Results) != 1 {
+		return false
+	}
+	w, _ := ret.Results[0].(*ast.CallExpr)
+	return w != nil && types.ExprString(w.Fun) == "fmt.Errorf" && len(w.Args) >= 2 &&
+		types.ExprString(w.Args[len(w.Args)-1]) == "err"
 }

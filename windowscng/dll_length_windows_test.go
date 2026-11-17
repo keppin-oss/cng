@@ -4,6 +4,7 @@ package windowscng
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -101,7 +102,7 @@ func TestSystemDirectoryLengths(t *testing.T) {
 			f := &fakeLengthCall{t: t, steps: tc.steps}
 			got, err := systemDirectoryWith(f.call)
 			checkLengthResult(t, got, err, tc.want, tc.wantErr)
-			if !equalInts(f.caps, tc.caps) {
+			if !slices.Equal(f.caps, tc.caps) {
 				t.Fatalf("caps = %v, want %v", f.caps, tc.caps)
 			}
 			f.requireGrowth()
@@ -147,7 +148,7 @@ func TestModuleFileNameLengths(t *testing.T) {
 			f := &fakeLengthCall{t: t, steps: tc.steps}
 			got, err := moduleFileNameWith(f.call)
 			checkLengthResult(t, got, err, tc.want, tc.wantErr)
-			if !equalInts(f.caps, tc.caps) {
+			if !slices.Equal(f.caps, tc.caps) {
 				t.Fatalf("caps = %v, want %v", f.caps, tc.caps)
 			}
 			f.requireGrowth()
@@ -188,16 +189,4 @@ func checkLengthResult(t *testing.T, got string, err error, want, wantErr string
 	if err == nil || !strings.Contains(err.Error(), wantErr) || got != "" {
 		t.Fatalf("got %q, %v; want error containing %q", got, err, wantErr)
 	}
-}
-
-func equalInts(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

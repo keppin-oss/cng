@@ -4,6 +4,7 @@ package windowscng
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -187,20 +188,49 @@ func notPrivileged() (bool, error) { return false, nil }
 func TestPostWriteVerificationKeepsOnlyNativeCauses(t *testing.T) {
 	p := mustServicePolicy(t, testServiceName)
 	prefix := `key "` + testKey + `": ` + ErrPostWriteVerification.Error()
+
+	// Expected texts are written out here, not produced by the formatters
+	// under test: the descriptor hex comes from hex.EncodeToString.
+	unrecognized := serviceSIDDescriptor(t, p.SID(), 0x80120089)
+	unrecognizedReason := "unrecognized security descriptor: ACE for service SID " + p.SID() +
+		" has mask 0x80120089, want exactly 0xA0000000 or 0x801200A9"
+	otherState := privilegedOnlyDescriptor(t)
+	otherStateReason := "persisted DACL is privileged-only, want service-sid(" + p.SID() + ")"
+	mismatch := func(reason string, sd []byte) string {
+		return ErrPolicyMismatch.Error() + ": " + reason +
+			"; security_information=DACL_SECURITY_INFORMATION; persisted_sd_dacl_hex=" + hex.EncodeToString(sd)
+	}
+	// readErr has the form getSecurityDescriptor returns for a failed
+	// NCryptGetProperty.
+	readErr := func(code uint32) error {
+		return withCauses(fmt.Sprintf("cannot read persisted security descriptor: hr=0x%x", code), &NCryptError{Op: "NCryptGetProperty", Code: code})
+	}
+	const readFailed = "read persisted DACL (descriptor unavailable): cannot read persisted security descriptor: hr=0x"
+
 	for _, tc := range []struct {
-		name  string
-		setup func(s *fakeStore)
-		want  string // text after prefix; "" checks only the start
-		code  uint32 // NCryptError code expected, 0 for none
+		name         string
+		setup        func(s *fakeStore)
+		want         string // full text after prefix
+		op           string // NCryptError expected through errors.As, "" for none
+		code         uint32
+		opens, reads int
 	}{
 		{"reopen denied", func(s *fakeStore) { s.reopenErr = openKeyStatusError(testKey, NTEPerm, "") },
-			`: reopen: NCryptOpenKey "` + testKey + `": hr=0x80090010`, NTEPerm},
+			`: reopen: NCryptOpenKey "` + testKey + `": hr=0x80090010`, "NCryptOpenKey", NTEPerm, 2, 2},
 		{"reopen not found", func(s *fakeStore) { s.reopenErr = openKeyStatusError(testKey, NTEBadKeyset, "") },
-			`: reopen: key "` + testKey + `": NCryptOpenKey hr=0x80090016: ` + ErrKeyNotFound.Error(), NTEBadKeyset},
-		{"read-back mismatch on open handle", func(s *fakeStore) { s.writeResult = serviceSIDDescriptor(t, p.SID(), 0x80120089) },
-			"", 0},
-		{"read-back mismatch on fresh handle", func(s *fakeStore) { s.reopenResult = serviceSIDDescriptor(t, p.SID(), 0x80120089) },
-			"", 0},
+			`: reopen: key "` + testKey + `": NCryptOpenKey hr=0x80090016: ` + ErrKeyNotFound.Error(), "NCryptOpenKey", NTEBadKeyset, 2, 2},
+		{"unrecognized descriptor on open handle", func(s *fakeStore) { s.writeResult = unrecognized },
+			": read-back on open handle: " + mismatch(unrecognizedReason, unrecognized), "", 0, 1, 2},
+		{"unrecognized descriptor on fresh handle", func(s *fakeStore) { s.reopenResult = unrecognized },
+			": read-back on fresh handle: " + mismatch(unrecognizedReason, unrecognized), "", 0, 2, 3},
+		{"other policy state on open handle", func(s *fakeStore) { s.writeResult = otherState },
+			": read-back on open handle: " + mismatch(otherStateReason, otherState), "", 0, 1, 2},
+		{"other policy state on fresh handle", func(s *fakeStore) { s.reopenResult = otherState },
+			": read-back on fresh handle: " + mismatch(otherStateReason, otherState), "", 0, 2, 3},
+		{"NCrypt read-back failure on open handle: no reopen", func(s *fakeStore) { s.sdErrAt = map[int]error{2: readErr(NTEPerm)} },
+			": read-back on open handle: " + readFailed + "80090010", "NCryptGetProperty", NTEPerm, 1, 2},
+		{"NCrypt read-back failure on fresh handle", func(s *fakeStore) { s.sdErrAt = map[int]error{3: readErr(NTEBadKeyset)} },
+			": read-back on fresh handle: " + readFailed + "80090016", "NCryptGetProperty", NTEBadKeyset, 2, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newFakeStore(t)
@@ -208,8 +238,8 @@ func TestPostWriteVerificationKeepsOnlyNativeCauses(t *testing.T) {
 			s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 			tc.setup(s)
 			err := applyServicePolicy(s, testKey, p)
-			if err == nil || !strings.HasPrefix(err.Error(), prefix) || (tc.want != "" && err.Error() != prefix+tc.want) {
-				t.Fatalf("err = %q, want %q", err, prefix+tc.want)
+			if err == nil || err.Error() != prefix+tc.want {
+				t.Fatalf("err  = %q\nwant = %q", err, prefix+tc.want)
 			}
 			if !errors.Is(err, ErrPostWriteVerification) {
 				t.Fatalf("ErrPostWriteVerification lost: %v", err)
@@ -219,11 +249,19 @@ func TestPostWriteVerificationKeepsOnlyNativeCauses(t *testing.T) {
 					t.Fatalf("errors.Is(err, %q) = true after the DACL write: %v", sentinel, err)
 				}
 			}
-			if tc.code != 0 {
-				requireNCrypt(t, err, "NCryptOpenKey", tc.code)
+			var ne *NCryptError
+			if tc.op == "" {
+				if errors.As(err, &ne) {
+					t.Fatalf("unexpected NCryptError %+v", ne)
+				}
+			} else {
+				requireNCrypt(t, err, tc.op, tc.code)
 			}
 			if len(s.writes) != 1 || len(s.deleted) != 0 || len(s.creates) != 0 {
-				t.Fatal("post-write rollback semantics changed")
+				t.Fatalf("writes=%v deleted=%v creates=%v, want one write and no create, delete or rollback", s.writes, s.deleted, s.creates)
+			}
+			if s.opens != tc.opens || s.sdReads != tc.reads {
+				t.Fatalf("opens=%d reads=%d, want %d and %d", s.opens, s.sdReads, tc.opens, tc.reads)
 			}
 			assertHandlesReleased(t, s)
 		})
@@ -274,12 +312,12 @@ func TestWin32CausesReadFromTheSameCall(t *testing.T) {
 	}
 	var verify *ast.FuncDecl
 	for _, d := range f.Decls {
-		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "verifyDACL" {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "verifyDescriptorDACL" {
 			verify = fd
 		}
 	}
 	if verify == nil {
-		t.Fatal("verifyDACL not found")
+		t.Fatal("verifyDescriptorDACL not found")
 	}
 	want := map[string]bool{"procGetSecurityDescriptorDacl": false, "procGetAclInformation": false, "procGetAce": false}
 	ast.Inspect(verify, func(n ast.Node) bool {
@@ -306,7 +344,7 @@ func TestWin32CausesReadFromTheSameCall(t *testing.T) {
 	})
 	for name, found := range want {
 		if !found {
-			t.Errorf("%s is not read through win32BOOLAndCallErr in verifyDACL", name)
+			t.Errorf("%s is not read through win32BOOLAndCallErr in verifyDescriptorDACL", name)
 		}
 	}
 	src := fileText(t, "cng_windows.go")

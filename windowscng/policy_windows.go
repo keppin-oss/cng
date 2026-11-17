@@ -15,7 +15,7 @@ var procCheckTokenMembership = advapi32.NewProc("CheckTokenMembership")
 // OpenWithPolicy opens the existing persisted machine-scoped key named name
 // without creating it, and returns a signer only if the key is non-exportable,
 // is ECDSA P-256, and its persisted DACL is exactly in the state required by
-// policy (see classifyDescriptor for the exact forms).
+// policy (see classifyDescriptorSID for the exact forms).
 //
 // For PolicyPrivilegedOnly the caller must be privileged (SYSTEM or an elevated
 // Administrators member); otherwise ErrPrivilegeRequired is returned before
@@ -53,8 +53,10 @@ func LoadOrCreateWithPolicy(name string, policy Policy) (Signer, error) {
 // It requires a privileged caller and only performs these transitions:
 //
 //   - the key is already exactly in the policy state: no write, nil (idempotent);
-//   - the key is exactly in the PolicyServiceSigner state and policy is
-//     PolicyPrivilegedOnly: the DACL is replaced with the privileged-only DACL.
+//   - the key is exactly in the PolicyServiceSigner state, or in the
+//     service-SID state of a ServicePolicy, and policy is
+//     PolicyPrivilegedOnly: the DACL is replaced with the privileged-only DACL
+//     (see TestApplyPolicyTightensServiceSIDKey).
 //
 // Any other state, including an unrecognized DACL or a request that would widen
 // access, returns ErrPolicyMismatch without modifying the key. The key must
@@ -68,6 +70,10 @@ func LoadOrCreateWithPolicy(name string, policy Policy) (Signer, error) {
 // write wraps ErrPostWriteVerification and no other sentinel of this package:
 // an error that is ErrPolicyMismatch or ErrKeyNotFound always means that the
 // DACL was not written.
+//
+// Provisioning and policy changes on the same key must be serialized by the
+// caller, also across processes. The package does not guarantee tighten-only
+// transitions with concurrent writers.
 func ApplyPolicy(name string, policy Policy) error {
 	return applyPolicy(nativeKeyStore{}, name, policy)
 }
@@ -147,6 +153,10 @@ func LoadOrCreateForService(name string, policy ServicePolicy) (Signer, error) {
 // modifying the key. Post-write verification is as for ApplyPolicy: every
 // failure after the write wraps ErrPostWriteVerification and no other sentinel
 // of this package.
+//
+// Provisioning and policy changes on the same key must be serialized by the
+// caller, also across processes. The package does not guarantee tighten-only
+// transitions with concurrent writers.
 func ApplyServicePolicy(name string, policy ServicePolicy) error {
 	return applyServicePolicy(nativeKeyStore{}, name, policy)
 }
@@ -461,14 +471,7 @@ func (nativeKeyStore) open(name string) (storedKey, error) {
 		procNCryptFreeObject.Call(provider)
 		return nil, fmt.Errorf("convert key name: %w", err)
 	}
-	var keyHandle uintptr
-	r := ncryptStatus(procNCryptOpenKey.Call(
-		provider,
-		uintptr(unsafe.Pointer(&keyHandle)),
-		uintptr(unsafe.Pointer(nameUTF16)),
-		0,
-		uintptr(openKeyFlags),
-	))
+	keyHandle, r := ncryptOpenKey(provider, nameUTF16, openKeyFlags)
 	if r != 0 {
 		procNCryptFreeObject.Call(provider)
 		return nil, openKeyStatusError(name, r, "")
@@ -527,7 +530,7 @@ func (k *nativeKey) signer() (Signer, error) {
 func (k *nativeKey) deleteCreated() error {
 	var err error
 	if k.key != 0 {
-		err = deletePersistedKey(k.key)
+		err = deleteKeyHandle(k.key)
 		k.key = 0
 	}
 	k.close()
