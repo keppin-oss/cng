@@ -43,6 +43,11 @@ type fakeStore struct {
 	pubErr    error
 	setErr    error
 	sdErr     error
+	// sdErrAt, if set, makes only the descriptor read with that 1-based
+	// number (counted by sdReads, across all handles) fail. In ApplyPolicy
+	// and ApplyServicePolicy read 1 is before the write, read 2 the read-back
+	// on the open handle and read 3 the read-back on the fresh handle.
+	sdErrAt   map[int]error
 	deleteErr error // failure of deleteCreated; the key then persists
 	sdReads   int
 	events    []string // descriptor read/delete ordering, no native operations
@@ -138,6 +143,9 @@ func (k *fakeKey) securityDescriptor() ([]byte, error) {
 	k.store.events = append(k.store.events, "read-descriptor")
 	if k.store.sdErr != nil {
 		return nil, k.store.sdErr
+	}
+	if err := k.store.sdErrAt[k.store.sdReads]; err != nil {
+		return nil, err
 	}
 	return k.sd, nil
 }
@@ -908,4 +916,72 @@ func TestPolicyZeroSizeExportComposition(t *testing.T) {
 			assertHandlesReleased(t, s)
 		}
 	})
+}
+
+// racingStore runs hook once, immediately before the first DACL write through
+// any key it opened, to simulate a second writer that completes between the
+// read and the write of the first.
+type racingStore struct {
+	*fakeStore
+	hook func()
+}
+
+func (s *racingStore) open(name string) (storedKey, error) {
+	k, err := s.fakeStore.open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &racingKey{storedKey: k, store: s}, nil
+}
+
+type racingKey struct {
+	storedKey
+	store *racingStore
+}
+
+func (k *racingKey) setSecurityDescriptor(sddl string) error {
+	if h := k.store.hook; h != nil {
+		k.store.hook = nil
+		h()
+	}
+	return k.storedKey.setSecurityDescriptor(sddl)
+}
+
+// TestOverlappingWritersAreNotCoordinated documents the current outcome, not a
+// guarantee: the package does not serialize writers (see the godoc of
+// ApplyPolicy and ApplyServicePolicy and "Limits to be aware of" in
+// docs/README.md; callers must serialize changes to the same key, also across
+// processes). A reads service-signer; B completes ApplyPolicy(PolicyPrivilegedOnly);
+// A then writes the service-SID DACL from its stale read. Both return nil and
+// the final state is service-SID: the service access B removed is granted again.
+// If a coordination is ever added, this test must change with it.
+func TestOverlappingWritersAreNotCoordinated(t *testing.T) {
+	svc, err := NewServicePolicy("Example.Policy.Agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := newFakeStore(t)
+	inner.privileged = true
+	inner.persisted[testKey] = serviceSignerDescriptor(t, genericRead|genericExecute)
+
+	var errB error
+	store := &racingStore{fakeStore: inner}
+	store.hook = func() { errB = applyPolicy(inner, testKey, PolicyPrivilegedOnly) }
+
+	errA := applyServicePolicy(store, testKey, svc)
+
+	if errB != nil || errA != nil {
+		t.Fatalf("B = %v, A = %v; the documented outcome is that both return nil", errB, errA)
+	}
+	state, sid, err := classifyDescriptorSID(inner.persisted[testKey])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != daclServiceSID || sid != svc.SID() {
+		t.Fatalf("final state = %s, want the service-sid state of A (B's tightening was overwritten)", describeState(state, sid))
+	}
+	if len(inner.writes) != 2 || inner.writes[0] != privilegedOnlySDDL || inner.writes[1] != svc.sddl() {
+		t.Fatalf("writes = %v, want B's privileged-only then A's service-sid", inner.writes)
+	}
+	assertHandlesReleased(t, inner)
 }

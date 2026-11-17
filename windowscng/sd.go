@@ -213,17 +213,10 @@ func parseSID(b []byte) (string, int, error) {
 	return sb.String(), size, nil
 }
 
-// classifyDescriptor reports which known per-key policy state a persisted
-// self-relative descriptor is in. It returns daclUnknown and a non-nil error
-// describing the first deviation for anything that is not an exact match.
-// See classifyDescriptorSID for the recognized forms.
-func classifyDescriptor(sd []byte) (daclState, error) {
-	st, _, err := classifyDescriptorSID(sd)
-	return st, err
-}
-
-// classifyDescriptorSID is classifyDescriptor that also returns, for the
-// service-sid state, the service SID the DACL grants.
+// classifyDescriptorSID reports which known per-key policy state a persisted
+// self-relative descriptor is in and, for the service-sid state, the service
+// SID the DACL grants. It returns daclUnknown and a non-nil error describing
+// the first deviation for anything that is not an exact match.
 //
 // Recognized states (ACE order is not significant; every ACE must be an
 // explicit ACCESS_ALLOWED_ACE with no flags, and the DACL must be protected):

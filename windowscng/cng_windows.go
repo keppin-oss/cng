@@ -211,12 +211,6 @@ func ncryptStatus(r, _ uintptr, _ error) uint32 {
 	return uint32(r)
 }
 
-// ncryptStatusAndCallErr is ncryptStatus for a seam that also hands the
-// Proc.Call last error to its caller.
-func ncryptStatusAndCallErr(r, _ uintptr, err error) (uint32, error) {
-	return uint32(r), err
-}
-
 // win32BOOL reports whether the Win32 BOOL returned by a call is TRUE, used as
 // win32BOOL(proc.Call(...)). BOOL is a 32-bit int: only the low 32 bits of the
 // return register are defined, zero is FALSE and any other value is TRUE.
@@ -284,6 +278,16 @@ func verifyDACL(keyHandle uintptr) error {
 	if err != nil {
 		return err
 	}
+	return verifyDescriptorDACL(buf)
+}
+
+// verifyDescriptorDACL is verifyDACL on an already read self-relative security
+// descriptor. After the read it uses only in-memory Win32 calls, so it needs
+// loadNativeAPIs but no key.
+func verifyDescriptorDACL(buf []byte) error {
+	if len(buf) == 0 {
+		return fmt.Errorf("persisted security descriptor is empty")
+	}
 
 	var daclPresent int32
 	var daclDefaulted int32
@@ -316,56 +320,53 @@ func verifyDACL(keyHandle uintptr) error {
 		return fmt.Errorf("persisted DACL has zero ACEs — key is inaccessible")
 	}
 
-	allocSid := func(sidStr string) (unsafe.Pointer, error) {
-		return convertStringSid(sidStr)
-	}
 	freeSid := func(p unsafe.Pointer) {
 		if p != nil {
 			procLocalFree.Call(uintptr(p))
 		}
 	}
 
-	sidSYSTEMp, err := allocSid(sidSYSTEM)
+	sidSYSTEMp, err := convertStringSid(sidSYSTEM)
 	if err != nil {
 		return err
 	}
 	defer freeSid(sidSYSTEMp)
-	sidAdminp, err := allocSid(sidAdministrators)
+	sidAdminp, err := convertStringSid(sidAdministrators)
 	if err != nil {
 		return err
 	}
 	defer freeSid(sidAdminp)
-	sidLSp, err := allocSid(sidLocalService)
+	sidLSp, err := convertStringSid(sidLocalService)
 	if err != nil {
 		return err
 	}
 	defer freeSid(sidLSp)
-	sidWDp, err := allocSid(sidEveryone)
+	sidWDp, err := convertStringSid(sidEveryone)
 	if err != nil {
 		return err
 	}
 	defer freeSid(sidWDp)
-	sidAUp, err := allocSid(sidAuthUsers)
+	sidAUp, err := convertStringSid(sidAuthUsers)
 	if err != nil {
 		return err
 	}
 	defer freeSid(sidAUp)
-	sidBUp, err := allocSid(sidBuiltinUsers)
+	sidBUp, err := convertStringSid(sidBuiltinUsers)
 	if err != nil {
 		return err
 	}
 	defer freeSid(sidBUp)
-	sidIUp, err := allocSid(sidInteractive)
+	sidIUp, err := convertStringSid(sidInteractive)
 	if err != nil {
 		return err
 	}
 	defer freeSid(sidIUp)
-	sidSUp, err := allocSid(sidService)
+	sidSUp, err := convertStringSid(sidService)
 	if err != nil {
 		return err
 	}
 	defer freeSid(sidSUp)
-	sidANp, err := allocSid(sidAnonymous)
+	sidANp, err := convertStringSid(sidAnonymous)
 	if err != nil {
 		return err
 	}
@@ -460,17 +461,47 @@ func verifyDACL(keyHandle uintptr) error {
 	return nil
 }
 
+// ncryptGetPropertyFunc runs one NCryptGetProperty of property on key. With
+// an empty out it asks for the size, otherwise it fills out. It stores the
+// returned size in result and returns the 32-bit status.
+type ncryptGetPropertyFunc func(key uintptr, property string, out []byte, result *uint32, flags uint32) uint32
+
+// nativeGetProperty is the production ncryptGetPropertyFunc. Each Go pointer
+// is converted inside the Call argument list, as the go:uintptrescapes
+// contract of systemProc.Call requires.
+func nativeGetProperty(key uintptr, property string, out []byte, result *uint32, flags uint32) uint32 {
+	if len(out) == 0 {
+		return ncryptStatus(procNCryptGetProperty.Call(
+			key,
+			uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(property))),
+			0, 0,
+			uintptr(unsafe.Pointer(result)),
+			uintptr(flags),
+		))
+	}
+	return ncryptStatus(procNCryptGetProperty.Call(
+		key,
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(property))),
+		uintptr(unsafe.Pointer(&out[0])),
+		uintptr(len(out)),
+		uintptr(unsafe.Pointer(result)),
+		uintptr(flags),
+	))
+}
+
 // getSecurityDescriptor reads the DACL portion of the persisted key's security
 // descriptor as a self-relative SECURITY_DESCRIPTOR.
 func getSecurityDescriptor(keyHandle uintptr) ([]byte, error) {
+	return getSecurityDescriptorWith(keyHandle, nativeGetProperty)
+}
+
+// getSecurityDescriptorWith queries the size, fills a buffer of that size and
+// returns only the bytes the fill reports as written. A nonzero status always
+// wins; a zero size from the query, and a fill that reports zero bytes or more
+// bytes than the buffer, are errors.
+func getSecurityDescriptorWith(keyHandle uintptr, get ncryptGetPropertyFunc) ([]byte, error) {
 	var propLen uint32
-	r := ncryptStatus(procNCryptGetProperty.Call(
-		keyHandle,
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Security Descr"))),
-		0, 0,
-		uintptr(unsafe.Pointer(&propLen)),
-		uintptr(daclSecurityInformation),
-	))
+	r := get(keyHandle, "Security Descr", nil, &propLen, daclSecurityInformation)
 	if r != 0 {
 		return nil, withCauses(fmt.Sprintf("cannot read persisted security descriptor: hr=0x%x", r), &NCryptError{Op: "NCryptGetProperty", Code: r})
 	}
@@ -479,23 +510,20 @@ func getSecurityDescriptor(keyHandle uintptr) ([]byte, error) {
 	}
 
 	buf := make([]byte, propLen)
-	r = ncryptStatus(procNCryptGetProperty.Call(
-		keyHandle,
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Security Descr"))),
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(propLen),
-		uintptr(unsafe.Pointer(&propLen)),
-		uintptr(daclSecurityInformation),
-	))
+	var written uint32
+	r = get(keyHandle, "Security Descr", buf, &written, daclSecurityInformation)
 	if r != 0 {
 		return nil, ncryptStatusError("NCryptGetProperty(Security Descr)", r)
 	}
-	// Compare as uint64: int(propLen) would turn negative on 32-bit Windows
-	// for sizes >= 0x80000000 and let the slice below panic.
-	if uint64(propLen) > uint64(len(buf)) {
-		return nil, fmt.Errorf("NCryptGetProperty(Security Descr): reported size %d exceeds buffer %d", propLen, len(buf))
+	if written == 0 {
+		return nil, fmt.Errorf("NCryptGetProperty(Security Descr): reported 0 bytes written")
 	}
-	return buf[:propLen], nil
+	// Compare as uint64: int(written) would turn negative on 32-bit Windows
+	// for sizes >= 0x80000000 and let the slice below panic.
+	if uint64(written) > uint64(len(buf)) {
+		return nil, fmt.Errorf("NCryptGetProperty(Security Descr): reported size %d exceeds buffer %d", written, len(buf))
+	}
+	return buf[:written], nil
 }
 
 // setSecurityDescriptor writes the DACL portion of sd to the persisted key.
@@ -518,19 +546,23 @@ func matchSid(s1, s2 unsafe.Pointer) bool {
 }
 
 func verifyExportPolicy(keyHandle uintptr) error {
-	var actualPolicy uint32
+	return verifyExportPolicyWith(keyHandle, nativeGetProperty)
+}
+
+// verifyExportPolicyWith reads the Export Policy property and rejects a key
+// whose policy permits any export or archiving. A response that does not
+// report exactly the 4 bytes of the DWORD is an error, never policy 0.
+func verifyExportPolicyWith(keyHandle uintptr, get ncryptGetPropertyFunc) error {
+	var raw [4]byte
 	var outLen uint32
-	r := ncryptStatus(procNCryptGetProperty.Call(
-		keyHandle,
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Export Policy"))),
-		uintptr(unsafe.Pointer(&actualPolicy)),
-		uintptr(unsafe.Sizeof(actualPolicy)),
-		uintptr(unsafe.Pointer(&outLen)),
-		uintptr(ncryptSilentFlag),
-	))
+	r := get(keyHandle, "Export Policy", raw[:], &outLen, ncryptSilentFlag)
 	if r != 0 {
 		return withCauses(fmt.Sprintf("cannot verify export policy: hr=0x%x", r), &NCryptError{Op: "NCryptGetProperty", Code: r})
 	}
+	if outLen != uint32(len(raw)) {
+		return fmt.Errorf("cannot verify export policy: reported size %d, want %d", outLen, len(raw))
+	}
+	actualPolicy := binary.LittleEndian.Uint32(raw[:])
 	forbidden := uint32(ncryptAllowExportFlag | ncryptAllowPlaintextExportFlag | ncryptAllowArchivingFlag | ncryptAllowPlaintextArchivingFlag)
 	if actualPolicy&forbidden != 0 {
 		return fmt.Errorf("export policy permits forbidden export/archiving (actual=0x%x)", actualPolicy)
@@ -548,8 +580,10 @@ func validatePersistedKey(keyHandle uintptr) error {
 	return nil
 }
 
-// deleteKeyHandle deletes an opened CNG key handle, enforcing NCryptDeleteKey
-// handle-ownership semantics.
+// deleteKeyHandle deletes the key behind an opened CNG key handle and obeys
+// NCryptDeleteKey handle ownership: on success NCryptDeleteKey frees the key
+// handle; on failure the handle is freed here, exactly once. The delete error
+// is returned, never discarded.
 func deleteKeyHandle(keyHandle uintptr) error {
 	return deleteCNGKeyHandle(keyHandle,
 		func(h uintptr) error {
@@ -561,14 +595,6 @@ func deleteKeyHandle(keyHandle uintptr) error {
 		},
 		func(h uintptr) { procNCryptFreeObject.Call(h) },
 	)
-}
-
-// deletePersistedKey deletes a key and obeys NCryptDeleteKey handle ownership:
-// on success NCryptDeleteKey frees the key handle; on failure the caller still
-// owns the handle and must free it explicitly. The delete error is returned,
-// never discarded.
-func deletePersistedKey(keyHandle uintptr) error {
-	return deleteKeyHandle(keyHandle)
 }
 
 // cleanupCreatedKey deletes a key created by the current call after a later
@@ -595,6 +621,22 @@ func openKeyStatusError(name string, r uint32, label string) error {
 	return withCauses(fmt.Sprintf("NCryptOpenKey %q%s: hr=0x%x", name, label, r), status)
 }
 
+// ncryptOpenKey runs NCryptOpenKey on the exact name with flags and returns
+// the key handle and the 32-bit status. On success the caller owns the key
+// handle. Each Go pointer is converted inside the Call argument list, as the
+// go:uintptrescapes contract of systemProc.Call requires.
+func ncryptOpenKey(provider uintptr, nameUTF16 *uint16, flags uint32) (uintptr, uint32) {
+	var keyHandle uintptr
+	r := ncryptStatus(procNCryptOpenKey.Call(
+		provider,
+		uintptr(unsafe.Pointer(&keyHandle)),
+		uintptr(unsafe.Pointer(nameUTF16)),
+		0,
+		uintptr(flags),
+	))
+	return keyHandle, r
+}
+
 // deleteKey deletes exactly one persisted CNG key by its exact name. It never
 // creates a key and never performs wildcard/prefix deletion.
 //
@@ -614,14 +656,7 @@ func deleteKey(name string) error {
 		return fmt.Errorf("convert key name: %w", err)
 	}
 
-	var keyHandle uintptr
-	r := ncryptStatus(procNCryptOpenKey.Call(
-		provider,
-		uintptr(unsafe.Pointer(&keyHandle)),
-		uintptr(unsafe.Pointer(nameUTF16)),
-		0,
-		uintptr(deleteKeyOpenFlags),
-	))
+	keyHandle, r := ncryptOpenKey(provider, nameUTF16, deleteKeyOpenFlags)
 	if r != 0 {
 		return openKeyStatusError(name, r, " (for delete)")
 	}
@@ -653,7 +688,7 @@ type legacyKeyOps interface {
 	// and keyHandle. On failure ownership of both handles stays with the caller.
 	newSigner(provider, keyHandle uintptr, name string) (Signer, error)
 	// deleteCreated deletes the key identified by keyHandle, with the handle
-	// contract of deletePersistedKey: success consumes the handle, failure
+	// contract of deleteKeyHandle: success consumes the handle, failure
 	// frees it once. It never looks the key up by name.
 	deleteCreated(keyHandle uintptr) error
 	// free runs NCryptFreeObject on a provider or key handle.
@@ -666,15 +701,7 @@ type nativeLegacyKeyOps struct{}
 func (nativeLegacyKeyOps) openProvider() (uintptr, error) { return openProvider() }
 
 func (nativeLegacyKeyOps) openKey(provider uintptr, nameUTF16 *uint16) (uintptr, uint32) {
-	var keyHandle uintptr
-	r := ncryptStatus(procNCryptOpenKey.Call(
-		provider,
-		uintptr(unsafe.Pointer(&keyHandle)),
-		uintptr(unsafe.Pointer(nameUTF16)),
-		0,
-		uintptr(openKeyFlags),
-	))
-	return keyHandle, r
+	return ncryptOpenKey(provider, nameUTF16, openKeyFlags)
 }
 
 func (nativeLegacyKeyOps) createKey(provider uintptr, nameUTF16 *uint16) (uintptr, error) {
@@ -694,7 +721,7 @@ func (nativeLegacyKeyOps) newSigner(provider, keyHandle uintptr, name string) (S
 }
 
 func (nativeLegacyKeyOps) deleteCreated(keyHandle uintptr) error {
-	return deletePersistedKey(keyHandle)
+	return deleteKeyHandle(keyHandle)
 }
 
 func (nativeLegacyKeyOps) free(h uintptr) { procNCryptFreeObject.Call(h) }
@@ -723,14 +750,20 @@ func openKeyWith(ops legacyKeyOps, name string) (Signer, error) {
 		return nil, openKeyStatusError(name, r, "")
 	}
 
-	// Existing keys are security-sensitive state. Revalidate every time before
-	// exposing a signer; proximity/name knowledge is not trust.
+	return signerForExistingKey(ops, provider, keyHandle, name)
+}
+
+// signerForExistingKey completes the open of a key that already existed: it
+// revalidates the key, because existing keys are security-sensitive state and
+// proximity or name knowledge is not trust, then builds the signer. The key
+// was not created by this call, so it is never deleted: on failure both
+// handles are freed here, once each. On success the signer owns both.
+func signerForExistingKey(ops legacyKeyOps, provider, keyHandle uintptr, name string) (Signer, error) {
 	if err := ops.validate(keyHandle); err != nil {
 		ops.free(keyHandle)
 		ops.free(provider)
 		return nil, fmt.Errorf("existing key %s failed security validation: %w", name, err)
 	}
-
 	signer, err := ops.newSigner(provider, keyHandle, name)
 	if err != nil {
 		ops.free(keyHandle)
@@ -760,21 +793,8 @@ func loadOrCreateKeyWith(ops legacyKeyOps, name string) (Signer, error) {
 
 	keyHandle, r := ops.openKey(provider, nameUTF16)
 	if r == 0 {
-		// Existing keys are security-sensitive state. Revalidate every time
-		// before exposing a signer; proximity/name knowledge is not trust.
 		// A key opened here was not created by this call: it is never deleted.
-		if err := ops.validate(keyHandle); err != nil {
-			ops.free(keyHandle)
-			ops.free(provider)
-			return nil, fmt.Errorf("existing key %s failed security validation: %w", name, err)
-		}
-		signer, err := ops.newSigner(provider, keyHandle, name)
-		if err != nil {
-			ops.free(keyHandle)
-			ops.free(provider)
-			return nil, err
-		}
-		return signer, nil
+		return signerForExistingKey(ops, provider, keyHandle, name)
 	}
 
 	// createKey never overwrites: a successful return proves that this call
@@ -913,13 +933,14 @@ func createPersistedKeyWith(ops createKeyNative, provider uintptr, nameUTF16 *ui
 		return 0, ncryptStatusError("set export policy", r)
 	}
 
-	// The DACL is set before NCryptFinalizeKey, so the key is persisted with it
-	// and never carries the provider's default security descriptor; see
-	// "Provisioning window" in docs/README.md. A failure up to and including
-	// this write leaves nothing persisted: releasing the handle is the whole
-	// cleanup. The callers validate the persisted DACL before returning a
-	// signer, so a provider that did not apply it fails closed and the key is
-	// deleted.
+	// The DACL is set before NCryptFinalizeKey so that the key is persisted
+	// with it and is not meant to carry the provider's default security
+	// descriptor. That the KSP honors a descriptor set before finalize was
+	// observed natively in one configuration only; see "Provisioning window"
+	// in docs/README.md. A failure up to and including this write leaves
+	// nothing persisted: releasing the handle is the whole cleanup. The
+	// callers validate the persisted DACL before returning a signer, so a
+	// provider that did not apply it fails closed and the key is deleted.
 	if err := ops.setSecurityDescriptor(keyHandle, sddl); err != nil {
 		ops.free(keyHandle)
 		return 0, err
@@ -927,7 +948,7 @@ func createPersistedKeyWith(ops createKeyNative, provider uintptr, nameUTF16 *ui
 
 	if r := ops.finalize(keyHandle); r != 0 {
 		return 0, cleanupAfterFinalizeFailure(r, func() uint32 {
-			// Same handle contract as deletePersistedKey: success consumes
+			// Same handle contract as deleteKeyHandle: success consumes
 			// the handle, failure leaves it to be freed exactly once.
 			d := ops.deleteKey(keyHandle)
 			if d != 0 {
@@ -999,10 +1020,11 @@ var errSignerClosed = errors.New("signer is closed")
 // backend to drive Sign/Close interleavings deterministically.
 type signerNative interface {
 	// signHashSize runs NCryptSignHash without an output buffer to obtain
-	// the signature size.
-	signHashSize(key uintptr, digest []byte, size *uint32) (hr uint32, callErr error)
+	// the signature size. Like every NCrypt call it returns only the 32-bit
+	// status: NCryptSignHash does not set the thread's last error.
+	signHashSize(key uintptr, digest []byte, size *uint32) (hr uint32)
 	// signHash runs NCryptSignHash into sig. sig is never empty.
-	signHash(key uintptr, digest, sig []byte, size *uint32) (hr uint32, callErr error)
+	signHash(key uintptr, digest, sig []byte, size *uint32) (hr uint32)
 	// freeObject runs NCryptFreeObject on a provider or key handle.
 	freeObject(h uintptr) (hr uint32)
 }
@@ -1012,8 +1034,8 @@ type signerNative interface {
 // systemProc.Call requires.
 type nativeSignerOps struct{}
 
-func (nativeSignerOps) signHashSize(key uintptr, digest []byte, size *uint32) (uint32, error) {
-	return ncryptStatusAndCallErr(procNCryptSignHash.Call(
+func (nativeSignerOps) signHashSize(key uintptr, digest []byte, size *uint32) uint32 {
+	return ncryptStatus(procNCryptSignHash.Call(
 		key, 0,
 		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
 		0, 0,
@@ -1022,8 +1044,8 @@ func (nativeSignerOps) signHashSize(key uintptr, digest []byte, size *uint32) (u
 	))
 }
 
-func (nativeSignerOps) signHash(key uintptr, digest, sig []byte, size *uint32) (uint32, error) {
-	return ncryptStatusAndCallErr(procNCryptSignHash.Call(
+func (nativeSignerOps) signHash(key uintptr, digest, sig []byte, size *uint32) uint32 {
+	return ncryptStatus(procNCryptSignHash.Call(
 		key, 0,
 		uintptr(unsafe.Pointer(&digest[0])), uintptr(len(digest)),
 		uintptr(unsafe.Pointer(&sig[0])), uintptr(len(sig)),
@@ -1092,9 +1114,7 @@ func (s *cngSigner) Sign(_ io.Reader, digest []byte, _ crypto.SignerOpts) ([]byt
 	native := s.ops()
 
 	var sigSize uint32
-	// The second result of the native seam is the Proc.Call last error, which
-	// NCryptSignHash does not set; only the returned status is reported.
-	if r, _ := native.signHashSize(s.key, digest, &sigSize); r != 0 {
+	if r := native.signHashSize(s.key, digest, &sigSize); r != 0 {
 		return nil, ncryptStatusError("NCryptSignHash (query size)", r)
 	}
 	if sigSize == 0 {
@@ -1102,7 +1122,7 @@ func (s *cngSigner) Sign(_ io.Reader, digest []byte, _ crypto.SignerOpts) ([]byt
 	}
 
 	sigBuf := make([]byte, sigSize)
-	if r, _ := native.signHash(s.key, digest, sigBuf, &sigSize); r != 0 {
+	if r := native.signHash(s.key, digest, sigBuf, &sigSize); r != 0 {
 		return nil, ncryptStatusError("NCryptSignHash", r)
 	}
 	// Compare as uint64: int(sigSize) would turn negative on 32-bit Windows

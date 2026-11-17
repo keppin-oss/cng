@@ -116,13 +116,13 @@ func (p *nativeConcProbe) exit() {
 	p.mu.Unlock()
 }
 
-func (p *nativeConcProbe) signHashSize(key uintptr, digest []byte, size *uint32) (uint32, error) {
+func (p *nativeConcProbe) signHashSize(key uintptr, digest []byte, size *uint32) uint32 {
 	p.enter(key, "NCryptSignHash(size)")
 	defer p.exit()
 	return p.inner.signHashSize(key, digest, size)
 }
 
-func (p *nativeConcProbe) signHash(key uintptr, digest, sig []byte, size *uint32) (uint32, error) {
+func (p *nativeConcProbe) signHash(key uintptr, digest, sig []byte, size *uint32) uint32 {
 	p.enter(key, "NCryptSignHash")
 	defer p.exit()
 	return p.inner.signHash(key, digest, sig, size)
