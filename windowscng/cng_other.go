@@ -48,3 +48,13 @@ func LoadOrCreateForService(name string, policy ServicePolicy) (Signer, error) {
 func ApplyServicePolicy(name string, policy ServicePolicy) error {
 	return fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
 }
+
+// CreateForService is not supported on non-Windows platforms.
+func CreateForService(name string, policy ServicePolicy) (Signer, error) {
+	return nil, fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
+}
+
+// DeleteForService is not supported on non-Windows platforms.
+func DeleteForService(name string, policy ServicePolicy, expectedSPKI []byte) error {
+	return fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
+}

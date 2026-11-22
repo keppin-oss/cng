@@ -26,7 +26,13 @@
 //   - with ServicePolicy (OpenForService, LoadOrCreateForService,
 //     ApplyServicePolicy), provision and verify a key whose DACL grants one
 //     Windows service's own SID instead of LOCAL SERVICE as a whole, and
-//     migrate a service-signer key to it in place.
+//     migrate a service-signer key to it in place;
+//   - with CreateForService, create a ServicePolicy key without ever adopting
+//     an existing one (ErrKeyExists on a name collision), unlike
+//     LoadOrCreateForService, which may adopt an existing key that holds the
+//     policy; with DeleteForService, delete a key only after verifying its
+//     export policy, P-256 public key, exact ServicePolicy DACL and expected
+//     SubjectPublicKeyInfo on the handle it opened.
 //
 // A Signer is safe for concurrent use: Close waits for Sign calls in progress
 // and makes at most one release attempt per handle; see Signer for the full

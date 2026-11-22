@@ -41,14 +41,21 @@ type fakeStore struct {
 	reopenErr error
 	exportErr error
 	pubErr    error
-	setErr    error
-	sdErr     error
+	// pub, if set, is the public key the fake reports; otherwise a zero key.
+	pub *ecdsa.PublicKey
+	// allowDeleteExisting lets deleteAndRelease run on a key the fake did not
+	// create, as DeleteForService does after verification.
+	allowDeleteExisting bool
+	// pubReads counts publicKey calls on every handle.
+	pubReads int
+	setErr   error
+	sdErr    error
 	// sdErrAt, if set, makes only the descriptor read with that 1-based
 	// number (counted by sdReads, across all handles) fail. In ApplyPolicy
 	// and ApplyServicePolicy read 1 is before the write, read 2 the read-back
 	// on the open handle and read 3 the read-back on the fresh handle.
 	sdErrAt   map[int]error
-	deleteErr error // failure of deleteCreated; the key then persists
+	deleteErr error // failure of deleteAndRelease; the key then persists
 	sdReads   int
 	events    []string // descriptor read/delete ordering, no native operations
 
@@ -57,7 +64,7 @@ type fakeStore struct {
 	// signer() leaves the key's handles with the caller.
 	signerErr   error
 	signerCalls int
-	deletedKeys []*fakeKey // identity of each key passed to deleteCreated
+	deletedKeys []*fakeKey // identity of each key passed to deleteAndRelease
 
 	privilegeChecks int
 	opens           int
@@ -101,7 +108,7 @@ func (s *fakeStore) create(name, sddl string) (storedKey, error) {
 		return nil, s.createErr
 	}
 	if _, exists := s.persisted[name]; exists {
-		return nil, errors.New("NTE_EXISTS")
+		return nil, nativeCollision()
 	}
 	sd := s.descriptorFor(sddl)
 	if s.writeResult != nil {
@@ -149,7 +156,13 @@ func (k *fakeKey) securityDescriptor() ([]byte, error) {
 	}
 	return k.sd, nil
 }
-func (k *fakeKey) publicKey() (*ecdsa.PublicKey, error) { return &ecdsa.PublicKey{}, k.store.pubErr }
+func (k *fakeKey) publicKey() (*ecdsa.PublicKey, error) {
+	k.store.pubReads++
+	if k.store.pub != nil {
+		return k.store.pub, k.store.pubErr
+	}
+	return &ecdsa.PublicKey{}, k.store.pubErr
+}
 
 func (k *fakeKey) setSecurityDescriptor(sddl string) error {
 	k.store.writes = append(k.store.writes, sddl)
@@ -177,12 +190,12 @@ func (k *fakeKey) signer() (Signer, error) {
 	return &fakeSigner{name: k.name}, nil
 }
 
-func (k *fakeKey) deleteCreated() error {
-	if !k.created {
-		k.store.t.Fatalf("deleteCreated called on pre-existing key %q", k.name)
+func (k *fakeKey) deleteAndRelease() error {
+	if !k.created && !k.store.allowDeleteExisting {
+		k.store.t.Fatalf("deleteAndRelease called on pre-existing key %q", k.name)
 	}
 	if k.done {
-		k.store.t.Fatalf("deleteCreated called after key %q lifetime ended", k.name)
+		k.store.t.Fatalf("deleteAndRelease called after key %q lifetime ended", k.name)
 	}
 	k.store.deleted = append(k.store.deleted, k.name)
 	k.store.deletedKeys = append(k.store.deletedKeys, k)
