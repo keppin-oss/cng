@@ -38,4 +38,10 @@ func TestPlatformUnsupported(t *testing.T) {
 	if err := ApplyServicePolicy("any", sp); err == nil {
 		t.Fatal("ApplyServicePolicy must fail on non-Windows")
 	}
+	if _, err := CreateForService("any", sp); err == nil {
+		t.Fatal("CreateForService must fail on non-Windows")
+	}
+	if err := DeleteForService("any", sp, []byte{0x30}); err == nil {
+		t.Fatal("DeleteForService must fail on non-Windows")
+	}
 }

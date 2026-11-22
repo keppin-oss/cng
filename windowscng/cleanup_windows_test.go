@@ -237,11 +237,11 @@ func (o *fakeLegacyOps) newSigner(provider, keyHandle uintptr, name string) (Sig
 	return &fakeLegacySigner{ops: o, provider: provider, key: keyHandle}, nil
 }
 
-// deleteCreated reuses the production handle contract (deleteCNGKeyHandle)
+// deleteAndRelease reuses the production handle contract (deleteCNGKeyHandle)
 // with a simulated NCryptDeleteKey that removes exactly the object behind the
 // handle, whatever name is currently bound.
-func (o *fakeLegacyOps) deleteCreated(keyHandle uintptr) error {
-	o.mustLive(keyHandle, "deleteCreated")
+func (o *fakeLegacyOps) deleteAndRelease(keyHandle uintptr) error {
+	o.mustLive(keyHandle, "deleteAndRelease")
 	o.deletedHandles = append(o.deletedHandles, keyHandle)
 	return deleteCNGKeyHandle(keyHandle,
 		func(h uintptr) error {

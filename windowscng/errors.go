@@ -21,7 +21,16 @@ const (
 	// NTEBadKeyset is NTE_BAD_KEYSET (0x80090016): the keyset does not
 	// exist, or is not accessible to the caller (see ErrKeyNotFound).
 	NTEBadKeyset uint32 = 0x80090016
+	// NTEExists is NTE_EXISTS (0x8009000F): a key with the requested name
+	// already exists (see ErrKeyExists).
+	NTEExists uint32 = 0x8009000F
 )
+
+// errCreateCollision marks, inside the package only, that
+// NCryptCreatePersistedKey itself reported NTE_EXISTS. It is unexported so that
+// the errors of LoadOrCreate and the other existing functions keep exactly the
+// sentinels they had; CreateForService turns it into ErrKeyExists.
+var errCreateCollision = errors.New("windowscng: create reported NTE_EXISTS")
 
 // NCryptError is a failed NCrypt call: the 32-bit SECURITY_STATUS in Code and
 // the operation in Op. Retrieve it with errors.As.

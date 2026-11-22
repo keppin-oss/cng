@@ -64,6 +64,24 @@ var ErrPolicyMismatch = errors.New("windowscng: persisted key does not match the
 // established. No key was opened, created or modified on that basis.
 var ErrPrivilegeRequired = errors.New("windowscng: operation requires a privileged (SYSTEM or elevated Administrators) caller")
 
+// ErrKeyExists indicates that CreateForService found a persisted key with the
+// requested name: NCryptCreatePersistedKey, called without
+// NCRYPT_OVERWRITE_KEY_FLAG, reported NTE_EXISTS. The existing key was not
+// opened, adopted, modified or deleted, and no signer is returned. The native
+// status stays reachable as an *NCryptError with Code NTEExists. Only the
+// status of the create call produces it; LoadOrCreate and the other functions
+// never return it.
+var ErrKeyExists = errors.New("windowscng: a persisted CNG key with this name already exists")
+
+// ErrDeleteVerificationFailed indicates that DeleteForService opened the key
+// but did not delete it, because a check on that open handle did not pass or
+// could not be completed: the key is exportable, is not a valid ECDSA P-256
+// key, its DACL is not exactly the requested ServicePolicy form, or its
+// public key differs from the expected SubjectPublicKeyInfo. Nothing was
+// deleted or modified. ErrPolicyMismatch is also wrapped when the cause is a
+// policy mismatch, and native causes stay reachable with errors.As.
+var ErrDeleteVerificationFailed = errors.New("windowscng: key verification failed before delete; nothing was deleted")
+
 // validate rejects the zero value and any undefined Policy.
 func (p Policy) validate() error {
 	switch p {

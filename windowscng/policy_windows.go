@@ -3,9 +3,13 @@
 package windowscng
 
 import (
+	"bytes"
 	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -92,7 +96,7 @@ type keyStore interface {
 	create(name, sddl string) (storedKey, error)
 }
 
-// storedKey is an open persisted key. Exactly one of close, deleteCreated or a
+// storedKey is an open persisted key. Exactly one of close, deleteAndRelease or a
 // successful signer call must end its lifetime.
 type storedKey interface {
 	verifyNonExportable() error
@@ -101,9 +105,12 @@ type storedKey interface {
 	setSecurityDescriptor(sddl string) error
 	// signer transfers ownership of the handles to the returned Signer.
 	signer() (Signer, error)
-	// deleteCreated deletes a key created by this call and releases handles.
-	// It returns the delete error; the handles are released either way.
-	deleteCreated() error
+	// deleteAndRelease deletes the key behind this handle and ends its
+	// lifetime: NCryptDeleteKey consumes the key handle on success, a failed
+	// delete frees it once, and the provider is released either way. It is
+	// called only for a key created by this call (rollback) or after
+	// DeleteForService verified the key; it returns the delete error.
+	deleteAndRelease() error
 	close()
 }
 
@@ -135,8 +142,92 @@ func OpenForService(name string, policy ServicePolicy) (Signer, error) {
 // that the key does not exist. An existing key in another state is never
 // converted; the result is ErrPolicyMismatch. Use ApplyServicePolicy for the
 // explicit migration of a PolicyServiceSigner key.
+//
+// It adopts an existing key that already holds the policy: the returned signer
+// may belong to a key this call did not create. Use CreateForService when an
+// existing key must never be adopted.
 func LoadOrCreateForService(name string, policy ServicePolicy) (Signer, error) {
 	return loadOrCreateForService(nativeKeyStore{}, name, policy)
+}
+
+// CreateForService creates a new persisted machine-scoped key named name with
+// the ServicePolicy DACL and returns its signer. Unlike LoadOrCreateForService,
+// which adopts an existing key that already holds the policy, it never opens,
+// adopts, modifies or deletes an existing key.
+//
+// It first rejects an empty name, a name containing a NUL character and an
+// invalid policy, with no native call at all. It then requires a privileged
+// caller (SYSTEM or an elevated Administrators member), a check that reads
+// the calling thread's token, before operating on the provider or on any key;
+// otherwise it returns ErrPrivilegeRequired. It then calls
+// NCryptCreatePersistedKey directly,
+// without NCRYPT_OVERWRITE_KEY_FLAG, with no prior open and no retry.
+//
+// If that create reports NTE_EXISTS, the error matches ErrKeyExists and,
+// with errors.As, an *NCryptError whose Code is NTEExists; the signer is nil
+// and nothing is deleted. NTE_EXISTS covers only a key already persisted under
+// the name. Two overlapping creates of the same name can both succeed with
+// different keys, the last NCryptFinalizeKey silently replacing the other: a
+// successful return does not reserve the name against other writers. The
+// caller must serialize every lifecycle operation on the same name (create,
+// rotation, delete, recovery), also across processes, record the
+// SubjectPublicKeyInfo of the returned key and compare it at every later open;
+// a mismatch is a conflict to report, never a key to adopt or to delete by
+// name.
+//
+// Any other failure is handled according to where it happens:
+//
+//   - before NCryptFinalizeKey (export policy or DACL write): only the handle
+//     is released, nothing was persisted;
+//   - NCryptFinalizeKey itself: as for LoadOrCreateForService, the key created
+//     by this call is deleted through the same handle;
+//   - after finalize (DACL verification or signer construction): the key
+//     created by this call is deleted through the same handle, never by name.
+//
+// When that delete is not confirmed, the error keeps the primary cause and
+// wraps ErrCleanupFailed: the key created by this call may persist and must be
+// inspected. Only on success does the caller own the returned signer and must
+// close it.
+func CreateForService(name string, policy ServicePolicy) (Signer, error) {
+	return createForService(nativeKeyStore{}, name, policy)
+}
+
+// DeleteForService deletes the persisted machine-scoped key named name only
+// after verifying, on the handle it opened, that the key is the one expected:
+// non-exportable, a valid ECDSA P-256 key, a DACL exactly in the ServicePolicy
+// form for policy's service SID (the classification used by OpenForService,
+// not a binary comparison of the whole security descriptor; owner, group and
+// SACL are not checked), and a public key whose PKIX DER encoding
+// (x509.MarshalPKIXPublicKey) is byte-for-byte expectedSPKI. Only then does it
+// call NCryptDeleteKey on that same handle.
+//
+// expectedSPKI is mandatory and must be the canonical DER SubjectPublicKeyInfo
+// of a P-256 key. An empty, malformed or non-canonical value, an empty name, a
+// name containing a NUL character and an invalid policy are rejected with no
+// native call at all. The caller must then be privileged (a check that reads
+// the calling thread's token); otherwise ErrPrivilegeRequired is returned and
+// nothing is opened or deleted. The public key is read once, validated and
+// compared from that single read.
+//
+// The results are distinct:
+//
+//   - invalid input: an error that matches no sentinel of this package;
+//   - ErrPrivilegeRequired;
+//   - an open failure, unchanged; ErrKeyNotFound does not prove that the key
+//     is absent;
+//   - ErrDeleteVerificationFailed when a check did not pass or could not be
+//     completed (also ErrPolicyMismatch for a policy mismatch): nothing was
+//     deleted, the policy is never corrected and there is no fallback;
+//   - a failure of NCryptDeleteKey itself, with its *NCryptError.
+//
+// Verification and delete act on the same open key object; this is not a
+// transaction and does not stop a concurrent writer from changing the DACL in
+// between. Callers must serialize provisioning, policy changes and deletion of
+// the same key, and must have recorded the expected SubjectPublicKeyInfo
+// before the key is used: a key whose SPKI was never recorded must not be
+// deleted by name alone.
+func DeleteForService(name string, policy ServicePolicy, expectedSPKI []byte) error {
+	return deleteForService(nativeKeyStore{}, name, policy, expectedSPKI)
 }
 
 // ApplyServicePolicy brings the existing persisted key named name to policy by
@@ -216,13 +307,24 @@ func requirePrivilege(ks keyStore) error {
 
 // checkKeyPolicy validates key profile and DACL state without modifying the key.
 func checkKeyPolicy(k storedKey, s policySpec) error {
+	_, err := checkKeyPolicyPublic(k, s)
+	return err
+}
+
+// checkKeyPolicyPublic is checkKeyPolicy that also returns the public key it
+// read and validated, so that a caller needing it does not read it twice.
+func checkKeyPolicyPublic(k storedKey, s policySpec) (*ecdsa.PublicKey, error) {
 	if err := k.verifyNonExportable(); err != nil {
-		return err
+		return nil, err
 	}
-	if _, err := k.publicKey(); err != nil {
-		return fmt.Errorf("%w: key is not a valid ECDSA P-256 key: %w", ErrPolicyMismatch, err)
+	pub, err := k.publicKey()
+	if err != nil {
+		return nil, fmt.Errorf("%w: key is not a valid ECDSA P-256 key: %w", ErrPolicyMismatch, err)
 	}
-	return checkDACLState(k, s)
+	if err := checkDACLState(k, s); err != nil {
+		return nil, err
+	}
+	return pub, nil
 }
 
 func checkDACLState(k storedKey, want policySpec) error {
@@ -332,6 +434,14 @@ func loadOrCreateSpec(ks keyStore, name string, s policySpec) (Signer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create key %q (%s): %w", name, s.label, err)
 	}
+	return finishCreated(k, name, s)
+}
+
+// finishCreated verifies a key created by this call and returns its signer.
+// On any failure the key is deleted through the same handle, never by name,
+// and the delete outcome is reported (ErrCleanupFailed when not confirmed).
+// It is shared by LoadOrCreate...Policy/ForService and CreateForService.
+func finishCreated(k storedKey, name string, s policySpec) (Signer, error) {
 	if err := checkKeyPolicy(k, s); err != nil {
 		// The key was created by this call and does not hold the requested
 		// policy (for example because of provider canonicalization): remove it
@@ -339,17 +449,114 @@ func loadOrCreateSpec(ks keyStore, name string, s policySpec) (Signer, error) {
 		// already contains the full descriptor buffer captured before deletion.
 		// The delete outcome is reported: on failure the error also wraps
 		// ErrCleanupFailed and the unverified key may persist.
-		return nil, fmt.Errorf("created key %q failed %s verification: %w", name, s.label, cleanupCreatedKey(err, k.deleteCreated))
+		return nil, fmt.Errorf("created key %q failed %s verification: %w", name, s.label, cleanupCreatedKey(err, k.deleteAndRelease))
 	}
 	signer, err := k.signer()
 	if err != nil {
 		// The key was created by this call and a failed signer() leaves its
 		// handles with k: delete it through the same handle, never by name.
-		// deleteCreated ends k's lifetime (delete consumes or frees the key
+		// deleteAndRelease ends k's lifetime (delete consumes or frees the key
 		// handle, then the provider is released), so k.close is not called.
-		return nil, cleanupCreatedKey(err, k.deleteCreated)
+		return nil, cleanupCreatedKey(err, k.deleteAndRelease)
 	}
 	return signer, nil
+}
+
+// validateKeyName rejects, before any native call, a name that cannot be an
+// exact key name: empty, or containing a NUL character (which the UTF-16
+// conversion of the native call would reject only after the provider is
+// opened).
+func validateKeyName(name string) error {
+	if name == "" {
+		return errors.New("windowscng: key name is empty")
+	}
+	if strings.IndexByte(name, 0) >= 0 {
+		return errors.New("windowscng: key name contains a NUL character")
+	}
+	return nil
+}
+
+func createForService(ks keyStore, name string, p ServicePolicy) (Signer, error) {
+	if err := validateKeyName(name); err != nil {
+		return nil, err
+	}
+	if err := p.validate(); err != nil {
+		return nil, err
+	}
+	s := p.spec()
+	if err := requirePrivilege(ks); err != nil {
+		return nil, err
+	}
+	k, err := ks.create(name, s.sddl)
+	if err != nil {
+		if errors.Is(err, errCreateCollision) {
+			return nil, fmt.Errorf("create key %q (%s): %w; the existing key was not opened or modified: %w", name, s.label, ErrKeyExists, err)
+		}
+		return nil, fmt.Errorf("create key %q (%s): %w", name, s.label, err)
+	}
+	return finishCreated(k, name, s)
+}
+
+// canonicalP256SPKI parses spki and accepts it only if it is the canonical
+// PKIX DER encoding of an ECDSA P-256 public key.
+func canonicalP256SPKI(spki []byte) error {
+	if len(spki) == 0 {
+		return errors.New("windowscng: expected SubjectPublicKeyInfo is empty")
+	}
+	pub, err := x509.ParsePKIXPublicKey(spki)
+	if err != nil {
+		return fmt.Errorf("windowscng: expected SubjectPublicKeyInfo is not valid PKIX DER: %v", err)
+	}
+	ec, ok := pub.(*ecdsa.PublicKey)
+	if !ok || ec.Curve != elliptic.P256() {
+		return errors.New("windowscng: expected SubjectPublicKeyInfo is not an ECDSA P-256 key")
+	}
+	again, err := x509.MarshalPKIXPublicKey(ec)
+	if err != nil || !bytes.Equal(again, spki) {
+		return errors.New("windowscng: expected SubjectPublicKeyInfo is not in canonical DER form")
+	}
+	return nil
+}
+
+func deleteForService(ks keyStore, name string, p ServicePolicy, expectedSPKI []byte) error {
+	if err := validateKeyName(name); err != nil {
+		return err
+	}
+	if err := p.validate(); err != nil {
+		return err
+	}
+	if err := canonicalP256SPKI(expectedSPKI); err != nil {
+		return err
+	}
+	s := p.spec()
+	if err := requirePrivilege(ks); err != nil {
+		return err
+	}
+	k, err := ks.open(name)
+	if err != nil {
+		return err
+	}
+	// The public key validated here is the one compared below: it is read once.
+	pub, err := checkKeyPolicyPublic(k, s)
+	if err != nil {
+		k.close()
+		return fmt.Errorf("key %q (%s): %w: %w", name, s.label, ErrDeleteVerificationFailed, err)
+	}
+	got, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		k.close()
+		return fmt.Errorf("key %q (%s): %w: encode public key: %v", name, s.label, ErrDeleteVerificationFailed, err)
+	}
+	if !bytes.Equal(got, expectedSPKI) {
+		k.close()
+		return fmt.Errorf("key %q (%s): %w: public key does not match the expected SubjectPublicKeyInfo", name, s.label, ErrDeleteVerificationFailed)
+	}
+	// From here k belongs to deleteAndRelease: success consumes the key
+	// handle, failure frees it once; the provider is released either way.
+	if err := k.deleteAndRelease(); err != nil {
+		return fmt.Errorf("delete key %q: %w", name, err)
+	}
+	return nil
 }
 
 func applyPolicy(ks keyStore, name string, p Policy) error {
@@ -527,7 +734,7 @@ func (k *nativeKey) signer() (Signer, error) {
 	return s, nil
 }
 
-func (k *nativeKey) deleteCreated() error {
+func (k *nativeKey) deleteAndRelease() error {
 	var err error
 	if k.key != 0 {
 		err = deleteKeyHandle(k.key)
