@@ -21,63 +21,57 @@ Use it when a Windows service or tool needs a signing key that
 
 ## Features
 
-- **Windows CNG keys** — `Open`, `LoadOrCreate` and `Delete` act on an exact,
-  caller-supplied key name. There is no enumeration, no wildcard deletion and
-  no private-key export.
-- **Signing** — keys are returned as a `Signer`, a `crypto.Signer` with a
+Four functions act on an exact, caller-supplied key name, each with the
+access policy of the key as a parameter. There is no enumeration, no wildcard
+deletion and no private-key export.
+
+| Function | What it does |
+|---|---|
+| `Open(name, policy)` | Opens an existing key and verifies that it is non-exportable, ECDSA P-256 and that its DACL is **exactly** the policy. Never creates, modifies or deletes a key. |
+| `Create(name, policy)` | Creates a new key with the policy's DACL. **Never adopts** an existing key: if a key with that name is already persisted, it returns `ErrKeyExists` and leaves it untouched. It does **not** reserve the name against a concurrent creator (see "Concurrent creators" below). |
+| `Delete(name, policy, expectedSPKI)` | Deletes a key only after checking, on the handle it opened, that it is non-exportable P-256, that its DACL is exactly the policy and that its public key is the expected `SubjectPublicKeyInfo`; otherwise it returns `ErrDeleteVerificationFailed` and deletes nothing. |
+| `Apply(name, policy)` | Rewrites the DACL of an existing key in place, only toward less access, idempotently. Never widens access, never recreates or deletes the key. |
+
+- **Signing** — `Open` and `Create` return a `Signer`, a `crypto.Signer` with a
   `Close` method. Signatures are ASN.1 DER ECDSA over a digest you compute.
 - **Access policies (ACL)** — each key carries a protected DACL, chosen when
-  the key is created. The policy functions below verify it exactly each time
-  the key is opened. `Open` and `LoadOrCreate` check less: SYSTEM,
-  Administrators and LOCAL SERVICE must be granted, listed broad principals
-  (Everyone, Users, Authenticated Users, …) must not be, and for LOCAL SERVICE
-  only the generic bits of the mask are checked. They do not require a
-  protected DACL and accept additional entries:
+  the key is created and verified exactly each time it is opened, deleted or
+  re-protected. The policy is a `KeyPolicy`, one of:
 
-  | Policy | Who can use the key |
-  |---|---|
-  | `PolicyServiceSigner` | SYSTEM, Administrators, and LOCAL SERVICE (read/execute) |
-  | `PolicyPrivilegedOnly` | SYSTEM and Administrators only |
-  | `ServicePolicy` | SYSTEM, Administrators, and **one** Windows service |
+  | Policy | Who can use the key | `Open` needs a privileged caller |
+  |---|---|---|
+  | `PolicyServiceSigner` | SYSTEM, Administrators, and LOCAL SERVICE (read/execute) | no |
+  | `PolicyPrivilegedOnly` | SYSTEM and Administrators only | yes |
+  | `NewServicePolicy("MyService")` | SYSTEM, Administrators, and **one** Windows service (`NT SERVICE\MyService`) | no |
 
-  Functions: `OpenWithPolicy`, `LoadOrCreateWithPolicy`, `ApplyPolicy`.
-- **Per-service keys (service SID)** — `NewServicePolicy("MyService")` grants
-  the key to that service's own SID (`NT SERVICE\MyService`) instead of to
-  every LOCAL SERVICE process. Functions: `OpenForService`,
-  `LoadOrCreateForService`, `ApplyServicePolicy`, `ServiceSID`.
-- **Create-only and verified delete (service SID)** — `CreateForService`
-  creates a new key and **never adopts** an existing one: if a key with that
-  name is already persisted, it returns `ErrKeyExists` and leaves the key
-  untouched. It does **not** reserve the name against a concurrent creator
-  (see "Concurrent creators" below).
-  `LoadOrCreateForService`, by contrast, opens and returns an existing key that
-  already holds the policy. `DeleteForService` deletes a key only after
-  checking, on the handle it opened, that it is non-exportable P-256, that its
-  DACL is exactly the `ServicePolicy` form and that its public key is the
-  expected `SubjectPublicKeyInfo`; otherwise it returns
-  `ErrDeleteVerificationFailed` and deletes nothing. Both need a privileged
-  caller. Nothing is deprecated: `Delete`, `LoadOrCreate` and the other
-  functions keep their behavior.
-- **Tighten-only changes** — `ApplyPolicy` and `ApplyServicePolicy` rewrite the
-  DACL of an existing key in place, only toward less access (for example
-  service-signer to privileged-only, or LOCAL SERVICE to one service). They
-  never widen access and never recreate or delete the key.
+  A `ServicePolicy` grants the key to that service's own SID instead of to
+  every LOCAL SERVICE process; `ServiceSID` computes that SID. Only these
+  values are accepted: `nil`, a pointer, the zero value or any other type is
+  an input error.
+- **Tighten-only changes** — `Apply` allows service-signer or service-SID to
+  privileged-only, and service-signer (LOCAL SERVICE) to one service SID.
+- **No create on a failed open** — the package never creates a key as a side
+  effect of an open. Choosing between `Open` and `Create`, and serializing
+  them, is the caller's job: `ErrKeyNotFound` is not proof that a key is
+  absent (see "Not found is ambiguous" below).
+
+`Create`, `Delete` and `Apply` need a privileged caller whatever the policy.
 
 ## Requirements
 
 - Windows, with the Microsoft Software Key Storage Provider.
 - Go 1.26.8 or later (`go.mod`). On other operating systems the package
-  compiles, but its constructors return an error.
+  compiles, but its functions return an error.
 - No third-party dependencies.
 - Creating, deleting or re-protecting a machine key needs a privileged context
   (SYSTEM or an elevated Administrator); the package never elevates or
-  impersonates. Opening an existing key needs only the access its DACL grants.
+  impersonates. Opening an existing key needs only the access its DACL grants,
+  except for `PolicyPrivilegedOnly`.
 
 ## Example
 
-Provision a key for one service from a privileged context, then sign with it.
-Inside the service itself, call `OpenForService` instead of
-`LoadOrCreateForService`.
+Provision a key for one service from a privileged context, record its public
+key, then sign with it. Inside the service itself, only call `Open`.
 
 ```go
 package main
@@ -86,6 +80,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"log"
 
 	"github.com/keppin-oss/cng/windowscng"
@@ -97,12 +92,20 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Opens the key, or creates it if absent (privileged callers only).
-	signer, err := windowscng.LoadOrCreateForService("Example.Agent.Key.v1", policy)
+	// Provisioning (privileged): create the key; an existing key is never adopted.
+	signer, err := windowscng.Create("Example.Agent.Key.v1", policy)
+	if err != nil {
+		log.Fatal(err) // ErrKeyExists if the name is already taken
+	}
+	defer signer.Close() // releases handles; the persisted key stays
+
+	// Record the identity of the key before using it: every later Open should
+	// compare it, and Delete requires it.
+	spki, err := x509.MarshalPKIXPublicKey(signer.Public())
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer signer.Close() // releases handles; the persisted key stays
+	_ = spki // store it durably
 
 	digest := sha256.Sum256([]byte("message"))
 	sig, err := signer.Sign(rand.Reader, digest[:], nil)
@@ -115,31 +118,80 @@ func main() {
 }
 ```
 
-For a key shared by LOCAL SERVICE processes, use
-`windowscng.LoadOrCreateWithPolicy(name, windowscng.PolicyServiceSigner)` and
-`windowscng.OpenWithPolicy(name, windowscng.PolicyServiceSigner)`, which verify
-the DACL exactly. `LoadOrCreate(name)` creates a key with the same DACL, but
-`LoadOrCreate` and `Open(name)` also accept an existing key whose DACL has
-additional entries. Runnable examples, which use the policy functions, are in
-[`examples/`](../examples/).
+The service opens the same key with `windowscng.Open("Example.Agent.Key.v1",
+policy)`; decommissioning deletes it with
+`windowscng.Delete("Example.Agent.Key.v1", policy, spki)`. Runnable examples are
+in [`examples/`](../examples/).
+
+## Migrating from v0.4.0
+
+v0.5.0 replaces the eleven key functions of v0.4.0 with the four above. There
+is no deprecation period: code written for v0.4.0 must change.
+
+| v0.4.0 | v0.5.0 |
+|---|---|
+| `OpenWithPolicy(n, p)`, `OpenForService(n, sp)` | `Open(n, p)`, `Open(n, sp)` |
+| `CreateForService(n, sp)` | `Create(n, sp)`; `Create(n, p)` is new for `PolicyServiceSigner` and `PolicyPrivilegedOnly` |
+| `DeleteForService(n, sp, spki)` | `Delete(n, sp, spki)`; also for the two `Policy` values |
+| `ApplyPolicy(n, p)`, `ApplyServicePolicy(n, sp)` | `Apply(n, p)`, `Apply(n, sp)` |
+| `Open(n)` | `Open(n, PolicyServiceSigner)` — see below |
+| `LoadOrCreate(n)`, `LoadOrCreateWithPolicy`, `LoadOrCreateForService` | removed: `Open`, and `Create` only where creating is intended, serialized by the caller |
+| `Delete(n)` | removed: `Delete(n, policy, spki)` with the recorded `SubjectPublicKeyInfo` |
+
+- **The legacy functions are gone.** `LoadOrCreate` created the key after
+  *any* failed open, and a key it opened might not have been created by the
+  caller. A key that cannot be opened is now an error to handle, never a
+  reason to create one.
+- **Legacy keys and `PolicyServiceSigner`.** Every release requested the same
+  DACL for keys created by `LoadOrCreate`:
+  `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;LS)`. A key with a valid profile and a
+  DACL in one of the forms this package explicitly accepts (below) opens with
+  `Open(n, PolicyServiceSigner)`. That the requested SDDL was identical does
+  not prove compatibility with a future canonicalization of the KSP. The
+  tolerant check of the legacy `Open` is gone; `Open` now rejects keys it used
+  to accept:
+  - a DACL that is not protected;
+  - access-allowed entries for principals that the legacy check neither
+    required nor listed as forbidden (for example a user, NETWORK SERVICE,
+    Guests or ALL APPLICATION PACKAGES), and entries of other types (deny,
+    callback), which the legacy check ignored; the broad principals it already
+    rejected (Everyone, Authenticated Users, Users, Interactive, Service,
+    Anonymous) stay rejected;
+  - inheritance or inherit-only flags on the required entries;
+  - SYSTEM or Administrators masks that contain `GENERIC_ALL` but are not
+    exactly `0x10000000` or `0xD01F01FF`;
+  - a LOCAL SERVICE mask that is not exactly `0x80000000`, `0xA0000000` or
+    `0x801200A9`, for example one that adds `WRITE_DAC`, `WRITE_OWNER`,
+    `DELETE` or is `0x801F01FF`.
+
+  `Apply` does not repair a DACL it does not recognize.
+- **Delete needs the recorded identity.** A key whose `SubjectPublicKeyInfo`
+  was never recorded cannot be deleted through this package; do not derive the
+  expected value by opening the same name just before deleting it.
+- **Errors.** The sentinels are unchanged. The texts of the removed legacy
+  validation (for example "existing key … failed security validation") and its
+  Win32 causes no longer appear.
 
 ## Security model
 
 - Keys are created in machine scope, non-exportable, in the Microsoft Software
   KSP. Only public-key material leaves the package.
 - The requested DACL is set **before** the key is finalized, then read back. A
-  signer is returned only if the persisted DACL passes validation; otherwise
-  the call fails and tries to delete the key it just created. See
+  signer is returned only if the persisted DACL is exactly the policy;
+  otherwise the call fails and tries to delete the key it just created. See
   [Provisioning window](#provisioning-window).
-- The policy functions accept a key only if its DACL matches the requested
-  policy **exactly** (protected, explicit allow entries, known principals and
-  masks). Anything else returns `ErrPolicyMismatch`.
+- Every function accepts a key only if its DACL matches the requested policy
+  **exactly** (protected, explicit allow entries, known principals and masks).
+  Anything else returns `ErrPolicyMismatch`. The accepted masks are those the
+  Microsoft Software KSP was observed to persist: `0x10000000` and `0xD01F01FF`
+  for SYSTEM and Administrators; `0x80000000`, `0xA0000000` and `0x801200A9`
+  for LOCAL SERVICE; `0xA0000000` and `0x801200A9` for a service SID.
 - `ncrypt.dll` and `advapi32.dll` are loaded only from the Windows system
   directory; key operations fail if a different module of the same name is
   already loaded.
-- Existing keys are never deleted, overwritten or regenerated by a failed call.
-  The only function that deletes an existing key on purpose besides `Delete`
-  is `DeleteForService`, and only after verifying it.
+- Existing keys are never deleted, overwritten or regenerated by a failed
+  call. The only function that deletes an existing key is `Delete`, and only
+  after verifying it.
 
 ### Provisioning window
 
@@ -150,16 +202,17 @@ DACL only after finalize. Established in code:
 
 - the private key is never exportable;
 - a failure before finalize persists nothing and only releases the handle;
-- no signer is returned for a new key unless the DACL read back after finalize
-  passes validation (for the policy functions, the exact policy). If the
-  provider did not apply the DACL, the call fails closed and deletes the key it
-  created (see **Not transactional** below).
+- no signer is returned for a new key unless the DACL read back after finalize,
+  on the same handle, is exactly the policy. If the provider did not apply the
+  DACL, the call fails closed and deletes the key it created through that
+  handle, never by name (see **Not transactional** below).
 
 Observed natively in one P3 run (`R20261028T090457Z-691bc4a2`, Windows NT
 10.0.26200, Microsoft Software KSP), in that configuration only: the KSP
 persisted a descriptor set before finalize, both with raw NCrypt calls and
-through `LoadOrCreateForService`. The first descriptor read after finalize was
-already the requested one, with no inheritance flags:
+through `LoadOrCreateForService` (the create path that `Create` now runs). The
+first descriptor read after finalize was already the requested one, with no
+inheritance flags:
 `D:P(A;;0xd01f01ff;;;SY)(A;;0xd01f01ff;;;BA)(A;;0x801200a9;;;<service-SID>)`.
 A key finalized with no descriptor set carried
 `D:P(A;OICI;0xd01f01ff;;;SY)(A;OICI;0xd01f01ff;;;BA)`, so on that build the
@@ -170,25 +223,25 @@ configurations, a provider that ignored the pre-finalize descriptor would make
 provisioning fail closed rather than produce a key.
 
 A process that opened a key before its DACL changed keeps its handle, which
-still matters for `ApplyPolicy` and `ApplyServicePolicy`. Provision keys from a
-trusted, quiescent context.
+still matters for `Apply`. Provision keys from a trusted, quiescent context.
 
 ## Errors
 
-| Error | Meaning |
-|---|---|
-| `ErrKeyNotFound` | Key not found **or** not accessible to the caller. |
-| `ErrPolicyMismatch` | The key's DACL is not the requested policy, or the change would widen access. No pre-existing key was modified; a key just created by `LoadOrCreate...` is deleted, or the error also wraps `ErrCleanupFailed`. |
-| `ErrPrivilegeRequired` | The operation needs SYSTEM or an elevated Administrator. |
-| `ErrKeyExists` | `CreateForService` found a key with that name (`NTE_EXISTS` from the create, also reachable as an `NCryptError` with `Code` `NTEExists`). The existing key was not opened, adopted, modified or deleted. |
-| `ErrDeleteVerificationFailed` | `DeleteForService` opened the key but a check did not pass or could not be completed (export policy, P-256 public key, exact DACL, expected SPKI). Nothing was deleted. Also wraps `ErrPolicyMismatch` for a policy mismatch. |
-| `ErrCleanupFailed` | A failed call created a key and could not delete it; inspect it. |
-| `ErrPostWriteVerification` | `ApplyPolicy`/`ApplyServicePolicy` wrote the DACL but could not confirm it; nothing was rolled back, inspect the key. Never retry or regenerate automatically. |
+| Error | Returned by | Meaning |
+|---|---|---|
+| input error (no sentinel) | all | Empty name, name with a NUL, invalid policy (`nil`, pointer, zero value, other type) or, for `Delete`, an empty, malformed or non-canonical P-256 `SubjectPublicKeyInfo`. No native call was made. |
+| `ErrPrivilegeRequired` | all | The operation needs SYSTEM or an elevated Administrator: `Create`, `Delete` and `Apply` always, `Open` only with `PolicyPrivilegedOnly`. Checked before any key is opened or created. |
+| `ErrKeyNotFound` | `Open`, `Delete`, `Apply` | Key not found **or** not accessible to the caller (`NTE_NOT_FOUND` or `NTE_BAD_KEYSET`). Never proof of absence, never a reason to `Create`. |
+| `ErrPolicyMismatch` | `Open`, `Create`, `Apply`, `Delete` | The key's DACL is not the requested policy or its public key is not P-256, or the change would widen access. A failure to *read* the DACL or the export policy is its own error. No pre-existing key was modified; a key just created by `Create` is deleted, or the error also wraps `ErrCleanupFailed`. |
+| `ErrKeyExists` | `Create` | `NCryptCreatePersistedKey` reported `NTE_EXISTS` (also reachable as an `NCryptError` with `Code` `NTEExists`), and only that step. The existing key was not opened, adopted, modified or deleted. |
+| `ErrCleanupFailed` | `Create` | The call failed after creating a key and could not delete it through the same handle; the key may persist, inspect it. Joined with the primary cause. |
+| `ErrDeleteVerificationFailed` | `Delete` | The key was opened but a check did not pass or could not be completed (export policy, P-256 public key, exact DACL, expected SPKI). Nothing was deleted. Also wraps `ErrPolicyMismatch` for a policy mismatch. A failure of `NCryptDeleteKey` itself is reported separately, with its `NCryptError`. |
+| `ErrPostWriteVerification` | `Apply` | The DACL was written but could not be confirmed; nothing was rolled back, inspect the key. It is the only sentinel of this package in that error. Never retry or regenerate automatically. |
 
 Use `errors.Is` for these sentinels, not the error text. They, `NCryptError`
 and the `NTE*` codes are declared on every platform, so shared code compiles
-on Windows and elsewhere; outside Windows the functions still only report that
-the platform is not supported.
+on Windows and elsewhere; outside Windows the functions only report that the
+platform is not supported.
 
 **Native causes.** Every failed NCrypt call is reachable as an
 `*NCryptError` with `errors.As`: `Code` is the 32-bit `SECURITY_STATUS`
@@ -196,8 +249,7 @@ the platform is not supported.
 `Op` describes the operation for people reading the error: it is not a
 stable identifier and the same NCrypt function can appear under different
 labels, so do not compare it. Win32 failures keep their `syscall.Errno`, so
-`ERROR_ACCESS_DENIED` (`syscall.Errno(5)`) is distinct from `NTE_PERM`. The
-error texts are unchanged.
+`ERROR_ACCESS_DENIED` (`syscall.Errno(5)`) is distinct from `NTE_PERM`.
 
 ```go
 var ne *windowscng.NCryptError
@@ -226,23 +278,24 @@ if errors.As(err, &ne) && ne.Code == windowscng.NTEPerm {
 - **Writers must be serialized by the caller.** Provisioning and policy
   changes on the same key must be serialized by the caller, also across
   processes. The package does not guarantee tighten-only transitions with
-  concurrent writers: `ApplyPolicy` and `ApplyServicePolicy` read the state
-  and then write, so an overlapping writer can make a stale write succeed
-  (for example a service-SID DACL written over a key that was just tightened
-  to privileged-only, both calls returning `nil`).
-- **Verified delete is not a transaction.** `DeleteForService` checks and
-  deletes the same open key object, but does not stop a concurrent writer from
-  changing the DACL in between; serialize deletion with provisioning and policy
+  concurrent writers: `Apply` reads the state and then writes, so an
+  overlapping writer can make a stale write succeed (for example a service-SID
+  DACL written over a key that was just tightened to privileged-only, both
+  calls returning `nil`).
+- **Verified delete is not a transaction.** `Delete` checks and deletes the
+  same open key object, but does not stop a concurrent writer from changing
+  the DACL in between; serialize deletion with provisioning and policy
   changes. Record the key's expected `SubjectPublicKeyInfo` before the key is
-  used: a key whose SPKI was never recorded must not be deleted by name alone.
-- **Concurrent creators.** `CreateForService` (and the create path of
-  `LoadOrCreate…`) relies on `NTE_EXISTS` from `NCryptCreatePersistedKey`,
-  which the documentation states for a key that "already exists": it does not
-  reserve a name between create and `NCryptFinalizeKey`. On the Microsoft
-  Software KSP, two overlapping creates of the same name were observed to both
-  succeed with different keys, the last finalize silently replacing the other
-  (native test, Windows 11). The package does not serialize creators. The
-  caller must:
+  used: a key whose SPKI was never recorded cannot be deleted through this
+  package, and the expected value must never be derived by opening the same
+  name just before the delete.
+- **Concurrent creators.** `Create` relies on `NTE_EXISTS` from
+  `NCryptCreatePersistedKey`, which the documentation states for a key that
+  "already exists": it does not reserve a name between create and
+  `NCryptFinalizeKey`. On the Microsoft Software KSP, two overlapping creates
+  of the same name were observed to both succeed with different keys, the last
+  finalize silently replacing the other (native test, Windows 11). The package
+  does not serialize creators. The caller must:
   - serialize every lifecycle operation on the same name (create, rotation,
     delete, recovery, maintenance tools) across processes, from before the
     create until the key's identity is recorded or the attempt is cleaned up;
@@ -253,24 +306,31 @@ if errors.As(err, &ne) && ne.Code == windowscng.NTEPerm {
   A writer that does not take part in that serialization (another software,
   an administrator acting on the same names) is outside the guarantee; the
   SPKI comparison detects the replacement afterwards, it does not prevent it.
+  In particular, "open, and create if not found" is not a safe pattern by
+  itself.
 - **"Not found" is ambiguous.** For a caller the DACL does not grant, the KSP
   reports the same status as for a missing key. Never treat `ErrKeyNotFound`
-  as proof of absence, and never regenerate an identity key because of it.
+  as proof of absence, and never create or regenerate an identity key because
+  of it.
 - **Static check only.** DACL validation inspects the descriptor; it is not a
   computation of Windows effective access (owner rights, privileges, SACL).
-- **Not transactional.** After an error a new key may still exist. If a key was
-  created and validated but building the signer then failed, the call deletes
-  that key; if the delete also fails, the error wraps `ErrCleanupFailed` and
-  the key may persist. One case is not a cleanup failure: for a
-  **non-privileged** caller (for example an Administrator with a UAC-filtered
-  token), when `NCryptFinalizeKey` is denied with `NTE_PERM` and deleting the
-  never finalized key reports `NTE_BAD_KEYSET`, the key was not persisted and
-  the error is the finalize denial alone. For a privileged caller, or if the
-  privilege check fails, and for any other combination, the error still wraps
-  `ErrCleanupFailed`. It was verified natively on Windows NT 10.0.26200 with
+- **Not transactional.** After an error a new key may still exist. If `Create`
+  created a key and a later step failed (the read-back of the DACL, the public
+  key, the signer), the call deletes that key through the same handle; if the
+  delete also fails, the error wraps `ErrCleanupFailed` and the key may
+  persist. One case is not a cleanup failure: for a **non-privileged** caller
+  (for example an Administrator with a UAC-filtered token), when
+  `NCryptFinalizeKey` is denied with `NTE_PERM` and deleting the never
+  finalized key reports `NTE_BAD_KEYSET` on that same handle, the key was not
+  persisted and the error is the finalize denial alone. For a privileged
+  caller, or if the privilege check fails, and for any other combination, the
+  error still wraps `ErrCleanupFailed`; after a successful finalize,
+  `NTE_BAD_KEYSET` never proves that the cleanup succeeded. Because `Create`
+  stops a non-privileged caller before the create, that case is not normally
+  reachable through it. It was verified natively on Windows NT 10.0.26200 with
   the Microsoft Software KSP, for an Administrator with a UAC-filtered token,
   a standard user and LOCAL SERVICE (run from a scheduled task), each with the
-  `LoadOrCreate`, privileged-only and service-SID DACLs: in all nine cases
+  service-signer, privileged-only and service-SID DACLs: in all nine cases
   finalize was denied with `NTE_PERM`, the delete reported `NTE_BAD_KEYSET`,
   and an elevated caller found the name absent by enumeration and by exact
   open both before and after, with a temporary control key found by both
@@ -279,16 +339,17 @@ if errors.As(err, &ne) && ne.Code == windowscng.NTEPerm {
   disk that the KSP does not expose. The check is the opt-in test
   `TestFinalizeFailureProbe` (build tag `cng_finalize_probe`); see
   [finalize-probe.md](finalize-probe.md) for the procedure and the matrix.
-- **Open handles are not revoked.** After `ApplyPolicy` or
-  `ApplyServicePolicy`, processes that already opened the key keep working;
-  restart or reopen consumers.
+- **Open handles are not revoked.** After `Apply`, processes that already
+  opened the key keep working with the access they had; restart or reopen
+  consumers.
 - **Service SID.** A service key works only if the service has its SID enabled,
   for example `sc.exe sidtype <service> unrestricted`.
 - **Verified scope.** Per-service isolation was verified natively on one setup:
   Windows NT 10.0.26200, Microsoft Software KSP, services running as LOCAL
   SERVICE with an unrestricted service SID, keys created by
-  `LoadOrCreateForService`. Other KSPs, Windows builds, restricted SIDs and
-  keys migrated with `ApplyServicePolicy` are not covered.
+  `LoadOrCreateForService` (v0.4.0; the create path of `Create`). Other KSPs,
+  Windows builds, restricted SIDs and keys migrated with `Apply` are not
+  covered.
 - **Lifecycle.** Call `Close` when done. A signer is safe for concurrent use:
   `Sign` calls may run in parallel, and `Close` waits for those already in
   progress, then makes at most one release attempt per handle. Overlapping
@@ -298,8 +359,7 @@ if errors.As(err, &ne) && ne.Code == windowscng.NTEPerm {
   first reports a failure to release a handle, and none retries it. `Close` does
   not drain your callers: stop and drain the users of the signer (for example,
   in-flight TLS handshakes) before closing it. Coordinate provisioning and
-  deletion outside this module; use `Delete` only for keys your application
-  owns.
+  deletion outside this module.
 
 ## Building and testing
 

@@ -60,7 +60,7 @@ const (
 	// deferred statement whose results are not used at all.
 	returnNCryptStatusOrCleanup
 	// returnBOOL is a 32-bit Win32 BOOL: the call must be passed directly to
-	// win32BOOL or win32BOOLAndCallErr.
+	// win32BOOLAndCallErr.
 	returnBOOL
 	// returnIgnored is a result this package never uses: the call must be a
 	// plain or deferred statement.
@@ -89,10 +89,6 @@ var nativeProcReturns = map[string]nativeReturn{
 	"procNCryptFreeObject":          returnNCryptStatusOrCleanup,
 
 	"procConvertStringSecurityDescriptorToSecurityDescriptorW": returnBOOL,
-	"procGetSecurityDescriptorDacl":                            returnBOOL,
-	"procGetAclInformation":                                    returnBOOL,
-	"procGetAce":                                               returnBOOL,
-	"procEqualSid":                                             returnBOOL,
 	"procConvertStringSidToSidW":                               returnBOOL,
 	"procCheckTokenMembership":                                 returnBOOL,
 
@@ -107,7 +103,7 @@ var nativeProcReturns = map[string]nativeReturn{
 
 var (
 	ncryptStatusWrappers = map[string]bool{"ncryptStatus": true}
-	win32BOOLWrappers    = map[string]bool{"win32BOOL": true, "win32BOOLAndCallErr": true}
+	win32BOOLWrappers    = map[string]bool{"win32BOOLAndCallErr": true}
 )
 
 // TestNativeReturnsUsedByType parses every non-test source file of the package
@@ -249,7 +245,7 @@ func checkNativeUse(id *ast.Ident, kind nativeReturn, stack []ast.Node) string {
 		}
 	case returnBOOL:
 		if !wrapped(win32BOOLWrappers) {
-			return "result is not read through win32BOOL or win32BOOLAndCallErr"
+			return "result is not read through win32BOOLAndCallErr"
 		}
 	case returnIgnored:
 		if !discarded() {
@@ -389,9 +385,7 @@ func TestNativeOpenAndCreateFlagsSource(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"deleteKey":                  "deleteKeyOpenFlags",
-		"nativeLegacyKeyOps.openKey": "openKeyFlags",
-		"nativeKeyStore.open":        "openKeyFlags",
+		"nativeKeyStore.open": "openKeyFlags",
 	}
 	got := map[string]string{}
 	for key, fd := range funcs {
@@ -430,7 +424,7 @@ func TestNativeOpenAndCreateFlagsSource(t *testing.T) {
 
 // TestNativeKeyDelegatesToVerifiersSource checks that the policy adapter of a
 // native key delegates to the package verifiers on the key handle, so that
-// ApplyPolicy and the Open functions cannot silently skip them.
+// Apply and the Open functions cannot silently skip them.
 func TestNativeKeyDelegatesToVerifiersSource(t *testing.T) {
 	funcs := sourceFuncs(parseNonTestSources(t))
 	for method, target := range map[string]string{
@@ -487,8 +481,6 @@ func exprStrings(es []ast.Expr) []string {
 //	verifyExportPolicy     -> return verifyExportPolicyWith(key, nativeGetProperty)
 //	getSecurityDescriptor  -> return getSecurityDescriptorWith(key, nativeGetProperty)
 //	loadSystemDLL          -> return loadSystemDLLWith(name, verifyModule)
-//	verifyDACL             -> buf, err := getSecurityDescriptor(key); ...; return verifyDescriptorDACL(buf)
-//	validatePersistedKey   -> verifyExportPolicy(key) then verifyDACL(key), each error returned
 func TestNativeWrappersDelegateSource(t *testing.T) {
 	funcs := sourceFuncs(parseNonTestSources(t))
 	get := func(name string) *ast.FuncDecl {
@@ -529,50 +521,6 @@ func TestNativeWrappersDelegateSource(t *testing.T) {
 		}
 	}
 
-	// verifyDACL: buf comes from getSecurityDescriptor(key), its error is
-	// returned, and the result is verifyDescriptorDACL(buf).
-	if fd := get("verifyDACL"); fd != nil {
-		key := param(fd, 0)
-		ok := false
-		if n := len(fd.Body.List); n == 3 {
-			as, _ := fd.Body.List[0].(*ast.AssignStmt)
-			ifs, _ := fd.Body.List[1].(*ast.IfStmt)
-			ret, _ := fd.Body.List[2].(*ast.ReturnStmt)
-			if as != nil && len(as.Lhs) == 2 && len(as.Rhs) == 1 && ifs != nil && ret != nil && len(ret.Results) == 1 {
-				buf, errName := types.ExprString(as.Lhs[0]), types.ExprString(as.Lhs[1])
-				read, _ := as.Rhs[0].(*ast.CallExpr)
-				final, _ := ret.Results[0].(*ast.CallExpr)
-				ok = read != nil && types.ExprString(read.Fun) == "getSecurityDescriptor" &&
-					strings.Join(exprStrings(read.Args), ",") == key &&
-					types.ExprString(ifs.Cond) == errName+" != nil" && ifs.Init == nil && ifs.Else == nil &&
-					len(ifs.Body.List) == 1 && returnsOnly(ifs.Body.List[0], errName) &&
-					final != nil && types.ExprString(final.Fun) == "verifyDescriptorDACL" &&
-					strings.Join(exprStrings(final.Args), ",") == buf
-			}
-		}
-		if !ok {
-			t.Error("verifyDACL must read the descriptor with getSecurityDescriptor(key), return its error, and end with return verifyDescriptorDACL(buf)")
-		}
-	}
-
-	// validatePersistedKey: each verifier is called once on the key handle and
-	// its error is returned (the DACL one wrapped with %w).
-	if fd := get("validatePersistedKey"); fd != nil {
-		key := param(fd, 0)
-		stmts := fd.Body.List
-		ok := len(stmts) == 3
-		if ok {
-			ok = checkVerifierIf(stmts[0], "verifyExportPolicy", key, false) &&
-				checkVerifierIf(stmts[1], "verifyDACL", key, true)
-			ret, _ := stmts[2].(*ast.ReturnStmt)
-			ok = ok && ret != nil && len(ret.Results) == 1 && types.ExprString(ret.Results[0]) == "nil"
-		}
-		if !ok {
-			t.Error("validatePersistedKey must be: if err := verifyExportPolicy(key); err != nil { return err }; " +
-				"if err := verifyDACL(key); err != nil { return fmt.Errorf(..., err) }; return nil")
-		}
-	}
-
 	// nativeGetProperty: both NCryptGetProperty calls take the property name
 	// from the property parameter and forward flags as the last argument.
 	if fd := get("nativeGetProperty"); fd != nil {
@@ -594,38 +542,4 @@ func TestNativeWrappersDelegateSource(t *testing.T) {
 			}
 		}
 	}
-}
-
-// returnsOnly reports whether s is "return name".
-func returnsOnly(s ast.Stmt, name string) bool {
-	ret, _ := s.(*ast.ReturnStmt)
-	return ret != nil && len(ret.Results) == 1 && types.ExprString(ret.Results[0]) == name
-}
-
-// checkVerifierIf reports whether s is `if err := verifier(key); err != nil
-// { return err }`, or with wrapped, a return of fmt.Errorf(..., err).
-func checkVerifierIf(s ast.Stmt, verifier, key string, wrapped bool) bool {
-	ifs, _ := s.(*ast.IfStmt)
-	if ifs == nil || ifs.Else != nil || len(ifs.Body.List) != 1 {
-		return false
-	}
-	as, _ := ifs.Init.(*ast.AssignStmt)
-	if as == nil || len(as.Lhs) != 1 || len(as.Rhs) != 1 || types.ExprString(as.Lhs[0]) != "err" {
-		return false
-	}
-	call, _ := as.Rhs[0].(*ast.CallExpr)
-	if call == nil || types.ExprString(call.Fun) != verifier || strings.Join(exprStrings(call.Args), ",") != key ||
-		types.ExprString(ifs.Cond) != "err != nil" {
-		return false
-	}
-	if !wrapped {
-		return returnsOnly(ifs.Body.List[0], "err")
-	}
-	ret, _ := ifs.Body.List[0].(*ast.ReturnStmt)
-	if ret == nil || len(ret.Results) != 1 {
-		return false
-	}
-	w, _ := ret.Results[0].(*ast.CallExpr)
-	return w != nil && types.ExprString(w.Fun) == "fmt.Errorf" && len(w.Args) >= 2 &&
-		types.ExprString(w.Args[len(w.Args)-1]) == "err"
 }

@@ -298,23 +298,12 @@ func TestCleanupAfterFinalizeSuccessKeepsBadKeysetAsFailure(t *testing.T) {
 			t.Fatalf("err = %v, want the cause and ErrCleanupFailed", err)
 		}
 	})
-	t.Run("legacy LoadOrCreate validation failure", func(t *testing.T) {
-		o := newFakeLegacyOps(t)
-		o.allowCreate = true
-		o.validateErr = errors.New("persisted DACL verification failed")
-		o.deleteErr = badKeyset
-		_, err := loadOrCreateKeyWith(o, legacyTestKey)
-		if !errors.Is(err, ErrCleanupFailed) || len(o.deletedHandles) != 1 {
-			t.Fatalf("err = %v deletes=%d, want ErrCleanupFailed and one delete", err, len(o.deletedHandles))
-		}
-		o.requireReleased()
-	})
-	t.Run("policy LoadOrCreate verification failure", func(t *testing.T) {
+	t.Run("Create verification failure", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
 		s.writeResult = privilegedOnlyDescriptor(t) // wrong policy for service-signer
 		s.deleteErr = badKeyset
-		_, err := loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
+		_, err := createWith(s, testKey, PolicyServiceSigner)
 		if !errors.Is(err, ErrPolicyMismatch) || !errors.Is(err, ErrCleanupFailed) {
 			t.Fatalf("err = %v, want ErrPolicyMismatch and ErrCleanupFailed", err)
 		}

@@ -31,7 +31,6 @@ func TestCNGFlagConstants(t *testing.T) {
 		{"genericRead", genericRead, 0x80000000},
 		{"genericWrite", genericWrite, 0x40000000},
 		{"genericExecute", genericExecute, 0x20000000},
-		{"genericRights", genericRights, 0xF0000000},
 	}
 	for _, tt := range tests {
 		if tt.got != tt.want {
@@ -63,21 +62,6 @@ func TestNCryptOpenKeyValidFlags(t *testing.T) {
 	}
 }
 
-func TestNCryptDeleteOpenFlags(t *testing.T) {
-	if deleteKeyOpenFlags != 0x00000060 {
-		t.Errorf("deleteKeyOpenFlags = 0x%08X, want 0x00000060 (machine|silent)", deleteKeyOpenFlags)
-	}
-	if deleteKeyOpenFlags&ncryptMachineKeyFlag == 0 {
-		t.Error("deleteKeyOpenFlags must include NCRYPT_MACHINE_KEY_FLAG")
-	}
-	if deleteKeyOpenFlags&ncryptSilentFlag == 0 {
-		t.Error("deleteKeyOpenFlags must include NCRYPT_SILENT_FLAG")
-	}
-	if deleteKeyOpenFlags&^uint32(ncryptMachineKeyFlag|ncryptSilentFlag) != 0 {
-		t.Error("deleteKeyOpenFlags must not contain any undocumented bits")
-	}
-}
-
 func TestNCryptSecurityDescrFlags(t *testing.T) {
 	if daclSecurityInformation&ncryptSilentFlag != 0 {
 		t.Fatalf("DACL_SECURITY_INFORMATION must not collide with NCRYPT_SILENT_FLAG in the value used here")
@@ -87,62 +71,9 @@ func TestNCryptSecurityDescrFlags(t *testing.T) {
 	}
 }
 
-func TestGenericAllIsOwnBit(t *testing.T) {
-	if genericAll == genericRights {
-		t.Fatal("GENERIC_ALL is a single bit, not the extraction mask")
-	}
-	if genericAll&(genericRead|genericWrite|genericExecute) != 0 {
-		t.Fatal("GENERIC_ALL must be distinct from READ/WRITE/EXECUTE")
-	}
-}
-
-func TestLocalServiceStaticMaskSemantics(t *testing.T) {
-	// This test checks a local generic-mask predicate, not the full DACL
-	// verifier or effective access. It does not infer signing capability from
-	// a serialized GENERIC_EXECUTE bit because the
-	// Microsoft Software KSP canonicalized the real persisted LS ACE to GR.
-	lsStaticValid := func(mask uint32) bool {
-		generic := mask & genericRights
-		return generic&genericRead != 0 && generic&genericWrite == 0 && generic&genericAll == 0
-	}
-
-	if !lsStaticValid(0x80000000) {
-		t.Error("persisted LOCAL SERVICE GR-only mask from manual proof must pass static boundary validation")
-	}
-	if !lsStaticValid(0xA0000000) {
-		t.Error("GR|GX must also pass static boundary validation")
-	}
-	if lsStaticValid(0xC0000000) {
-		t.Error("GR|GW must fail: GENERIC_WRITE is rejected")
-	}
-	if lsStaticValid(0x90000000) {
-		t.Error("GR|GA must fail: GENERIC_ALL is rejected")
-	}
-	if lsStaticValid(0x20000000) {
-		t.Error("GX-only must fail: GENERIC_READ is required")
-	}
-}
-
-func TestSystemAdminStaticMaskSemantics(t *testing.T) {
-	hasGenericAll := func(mask uint32) bool { return mask&genericAll != 0 }
-	for _, mask := range []uint32{0x10000000, 0xD0000000, 0xF0000000} {
-		if !hasGenericAll(mask) {
-			t.Errorf("0x%08X should contain GENERIC_ALL", mask)
-		}
-	}
-	for _, mask := range []uint32{0, 0x80000000, 0xA0000000, 0xC0000000} {
-		if hasGenericAll(mask) {
-			t.Errorf("0x%08X should not contain GENERIC_ALL", mask)
-		}
-	}
-}
-
 func TestACLInspectionConstants(t *testing.T) {
 	if aceTypeAccessAllowed != 0 {
 		t.Errorf("aceTypeAccessAllowed = %d, want 0", aceTypeAccessAllowed)
-	}
-	if aclSizeInfoClass != 2 {
-		t.Errorf("aclSizeInfoClass = %d, want 2", aclSizeInfoClass)
 	}
 }
 
@@ -402,7 +333,7 @@ func validP256Blob() []byte {
 
 // zeroSizeExportError returns the error that exportPublicKeyWith really
 // produces for a successful size query reporting 0 bytes. Composition tests
-// inject it through the existing legacy and policy seams.
+// inject it through the policy seam.
 func zeroSizeExportError(t *testing.T) error {
 	t.Helper()
 	_, err := runFakeExport(t, exportStep{status: 0, result: 0})

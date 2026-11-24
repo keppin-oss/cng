@@ -91,9 +91,6 @@ func TestWin32BOOLIgnoresUpperBits(t *testing.T) {
 				t.Skip("uintptr has no upper 32 bits on this architecture")
 			}
 			errno := syscall.Errno(5)
-			if got := win32BOOL(uintptr(tc.raw), 0, errno); got != tc.want {
-				t.Fatalf("win32BOOL(0x%x) = %v, want %v", tc.raw, got, tc.want)
-			}
 			got, callErr := win32BOOLAndCallErr(uintptr(tc.raw), 0, errno)
 			if got != tc.want || callErr != errno {
 				t.Fatalf("win32BOOLAndCallErr(0x%x) = %v, %v", tc.raw, got, callErr)

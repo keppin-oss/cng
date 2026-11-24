@@ -18,11 +18,10 @@ package windowscng
 // and deletes only that name. No wildcard/prefix deletion. t.Cleanup is
 // registered immediately after the key is created, before any other check.
 //
-// Known limit (TOCTOU): the absence pre-check (Open == ErrKeyNotFound) and
-// LoadOrCreate are not atomic, LoadOrCreate does not report whether it
-// opened or created the key, and ErrKeyNotFound also covers "not
-// accessible". Exclusivity of the name therefore rests on the pre-check plus
-// 64 random bits, not on a formal proof that this test created the key.
+// Known limit (TOCTOU): Create never adopts a key already persisted under the
+// name (ErrKeyExists), but it does not reserve the name against a concurrent
+// creator. Exclusivity of the name therefore rests on the pre-check plus 64
+// random bits, not on a formal proof that no other writer used it.
 //
 // Known limit (cleanup): t.Cleanup cannot run if the process dies: a native
 // crash (for example an access violation inside ncrypt.dll), a killed
@@ -45,6 +44,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -246,6 +246,7 @@ func nativeConcAllStacks() string {
 type nativeConcEnv struct {
 	name string
 	pub  *ecdsa.PublicKey
+	spki []byte
 
 	mu      sync.Mutex
 	signers []Signer
@@ -291,7 +292,7 @@ func (e *nativeConcEnv) cleanup(t *testing.T) {
 		return
 	}
 	// Close is idempotent: round signers already closed return nil, and the
-	// initial LoadOrCreate signer (index 0) makes its first and only release
+	// initial Create signer (index 0) makes its first and only release
 	// attempt here. A failure is reported, never retried, and the key is
 	// still deleted and checked below.
 	for i, s := range signers {
@@ -299,11 +300,11 @@ func (e *nativeConcEnv) cleanup(t *testing.T) {
 			t.Errorf("CLEANUP: Close of signer %d on %q = %v (handle release failed; not retried)", i, e.name, err)
 		}
 	}
-	if err := Delete(e.name); err != nil {
+	if err := Delete(e.name, PolicyServiceSigner, e.spki); err != nil {
 		t.Errorf("CLEANUP: Delete(%q) = %v — disposable key may persist, inspect manually", e.name, err)
 		return
 	}
-	if s, err := Open(e.name); !errors.Is(err, ErrKeyNotFound) {
+	if s, err := Open(e.name, PolicyServiceSigner); !errors.Is(err, ErrKeyNotFound) {
 		if err == nil {
 			if cerr := s.Close(); cerr != nil {
 				t.Errorf("CLEANUP: Close of unexpected post-Delete signer on %q = %v", e.name, cerr)
@@ -327,7 +328,7 @@ func nativeConcKey(t *testing.T) *nativeConcEnv {
 	name := fmt.Sprintf("%sR%s-%s", nativeConcKeyPrefix, time.Now().UTC().Format("20060102T150405Z"), hex.EncodeToString(rnd[:]))
 
 	// The name must not exist: never reuse or touch a pre-existing key.
-	if s, err := Open(name); err == nil {
+	if s, err := Open(name, PolicyServiceSigner); err == nil {
 		_ = s.Close()
 		t.Fatalf("disposable key name %q already exists; refusing to use or delete it", name)
 	} else if !errors.Is(err, ErrKeyNotFound) {
@@ -337,26 +338,32 @@ func nativeConcKey(t *testing.T) *nativeConcEnv {
 	// Logged before creation so that a key left by a process crash can be
 	// identified.
 	t.Logf("NATIVE: creating disposable key %q (MS Software KSP, ECDSA P-256, machine scope)", name)
-	created, err := LoadOrCreate(name)
+	created, err := Create(name, PolicyServiceSigner)
 	if err != nil {
 		// Not a SKIP: this test is explicitly opted into with its build tag.
-		// The key is not deleted here: that this test created it cannot be
-		// proven, so its presence is only reported.
-		if s, openErr := Open(name); openErr == nil {
+		// The key is not deleted here: a failed Create has already deleted
+		// what it created, unless the error wraps ErrCleanupFailed, and any
+		// other key under this name is not this test's.
+		if s, openErr := Open(name, PolicyServiceSigner); openErr == nil {
 			_ = s.Close()
-			t.Fatalf("NATIVE: LoadOrCreate(%q) failed: %v; a key with this name now exists and was NOT deleted, inspect manually", name, err)
+			t.Fatalf("NATIVE: Create(%q) failed: %v; a key with this name now exists and was NOT deleted, inspect manually", name, err)
 		}
-		t.Fatalf("NATIVE: LoadOrCreate(%q) failed (elevated context required): %v", name, err)
+		t.Fatalf("NATIVE: Create(%q) failed (elevated context required): %v", name, err)
 	}
-
-	e := &nativeConcEnv{name: name, signers: []Signer{created}}
-	t.Cleanup(func() { e.cleanup(t) }) // registered before any check that can fail
 
 	pub, ok := created.Public().(*ecdsa.PublicKey)
 	if !ok {
-		t.Fatalf("Public() = %T, want *ecdsa.PublicKey", created.Public())
+		_ = created.Close()
+		t.Fatalf("Public() = %T, want *ecdsa.PublicKey; disposable key %q left in place, inspect manually", created.Public(), name)
 	}
-	e.pub = pub
+	spki, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		_ = created.Close()
+		t.Fatalf("MarshalPKIXPublicKey: %v; disposable key %q left in place, inspect manually", err, name)
+	}
+
+	e := &nativeConcEnv{name: name, signers: []Signer{created}, pub: pub, spki: spki}
+	t.Cleanup(func() { e.cleanup(t) }) // registered before any check that can fail
 	t.Logf("NATIVE: created disposable key %q", name)
 	return e
 }
@@ -365,7 +372,7 @@ func nativeConcKey(t *testing.T) *nativeConcEnv {
 // handles) and checks that it is the production cngSigner on real handles.
 func nativeConcOpen(t *testing.T, e *nativeConcEnv) *cngSigner {
 	t.Helper()
-	s, err := Open(e.name)
+	s, err := Open(e.name, PolicyServiceSigner)
 	if err != nil {
 		t.Fatalf("NATIVE: Open(%q): %v", e.name, err)
 	}

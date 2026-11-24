@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-// Offline tests of CreateForService and DeleteForService (contract C1–C3):
+// Offline tests of Create and Delete (contract C1–C3):
 // the policy engine against the in-memory fake keyStore, and the create step
 // against the simulated createKeyNative backend. They never open, create,
 // modify or delete a real persisted CNG key.
@@ -68,7 +68,7 @@ func TestCreatePersistedKeyMarksOnlyTheCreateCollision(t *testing.T) {
 		}
 		assertNCryptCode(t, err, NTEExists)
 		if errors.Is(err, ErrKeyExists) {
-			t.Fatal("the create step itself must not expose ErrKeyExists (LoadOrCreate keeps its sentinels)")
+			t.Fatal("the create step itself must not expose ErrKeyExists (only Create maps it to ErrKeyExists)")
 		}
 		f.requireCalls("create")
 	})
@@ -89,18 +89,18 @@ func TestCreatePersistedKeyMarksOnlyTheCreateCollision(t *testing.T) {
 	})
 }
 
-func TestCreateForService(t *testing.T) {
+func TestCreateContract(t *testing.T) {
 	p := mustServicePolicy(t, testServiceName)
 
 	t.Run("invalid input reaches no native call", func(t *testing.T) {
 		for name, run := range map[string]func(*fakeStore) error{
-			"empty name": func(s *fakeStore) error { _, err := createForService(s, "", p); return err },
+			"empty name": func(s *fakeStore) error { _, err := createWith(s, "", p); return err },
 			"NUL in name": func(s *fakeStore) error {
-				_, err := createForService(s, "a\x00b", p)
+				_, err := createWith(s, "a\x00b", p)
 				return err
 			},
 			"invalid policy": func(s *fakeStore) error {
-				_, err := createForService(s, testKey, ServicePolicy{name: testServiceName})
+				_, err := createWith(s, testKey, ServicePolicy{name: testServiceName})
 				return err
 			},
 		} {
@@ -116,7 +116,7 @@ func TestCreateForService(t *testing.T) {
 	})
 	t.Run("NUL in name: input error even for a non-privileged caller", func(t *testing.T) {
 		s := newFakeStore(t)
-		_, err := createForService(s, "a\x00b", p)
+		_, err := createWith(s, "a\x00b", p)
 		if err == nil || errors.Is(err, ErrPrivilegeRequired) || s.privilegeChecks != 0 {
 			t.Fatalf("err=%v privilegeChecks=%d, want an input error before the token check", err, s.privilegeChecks)
 		}
@@ -124,7 +124,7 @@ func TestCreateForService(t *testing.T) {
 	})
 	t.Run("non-privileged caller: no create", func(t *testing.T) {
 		s := newFakeStore(t)
-		_, err := createForService(s, testKey, p)
+		_, err := createWith(s, testKey, p)
 		if !errors.Is(err, ErrPrivilegeRequired) {
 			t.Fatalf("err = %v, want ErrPrivilegeRequired", err)
 		}
@@ -137,7 +137,7 @@ func TestCreateForService(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
 		s.privErr = errors.New("token query failed")
-		_, err := createForService(s, testKey, p)
+		_, err := createWith(s, testKey, p)
 		if !errors.Is(err, ErrPrivilegeRequired) {
 			t.Fatalf("err = %v, want ErrPrivilegeRequired", err)
 		}
@@ -146,7 +146,7 @@ func TestCreateForService(t *testing.T) {
 	t.Run("success: one create, no open, no delete", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
-		signer, err := createForService(s, testKey, p)
+		signer, err := createWith(s, testKey, p)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -161,7 +161,7 @@ func TestCreateForService(t *testing.T) {
 		s.privileged = true
 		before := serviceSIDDescriptor(t, p.SID(), genericRead|genericExecute)
 		s.persisted[testKey] = before
-		signer, err := createForService(s, testKey, p)
+		signer, err := createWith(s, testKey, p)
 		if signer != nil || !errors.Is(err, ErrKeyExists) {
 			t.Fatalf("signer=%v err=%v, want ErrKeyExists", signer, err)
 		}
@@ -182,7 +182,7 @@ func TestCreateForService(t *testing.T) {
 			s := newFakeStore(t)
 			s.privileged = true
 			s.createErr = cerr
-			_, err := createForService(s, testKey, p)
+			_, err := createWith(s, testKey, p)
 			if err == nil || errors.Is(err, ErrKeyExists) {
 				t.Errorf("%s: err = %v, want a create failure without ErrKeyExists", name, err)
 			}
@@ -193,7 +193,7 @@ func TestCreateForService(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
 		s.writeResult = serviceSignerDescriptor(t, genericRead|genericExecute)
-		_, err := createForService(s, testKey, p)
+		_, err := createWith(s, testKey, p)
 		if !errors.Is(err, ErrPolicyMismatch) || errors.Is(err, ErrKeyExists) || errors.Is(err, ErrCleanupFailed) {
 			t.Fatalf("err = %v, want ErrPolicyMismatch with confirmed cleanup", err)
 		}
@@ -210,7 +210,7 @@ func TestCreateForService(t *testing.T) {
 		s.privileged = true
 		s.writeResult = serviceSignerDescriptor(t, genericRead|genericExecute)
 		s.deleteErr = ncryptStatusError("NCryptDeleteKey", NTEPerm)
-		_, err := createForService(s, testKey, p)
+		_, err := createWith(s, testKey, p)
 		if !errors.Is(err, ErrPolicyMismatch) || !errors.Is(err, ErrCleanupFailed) {
 			t.Fatalf("err = %v, want ErrPolicyMismatch and ErrCleanupFailed", err)
 		}
@@ -220,7 +220,7 @@ func TestCreateForService(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
 		s.signerErr = errors.New("second export failed")
-		_, err := createForService(s, testKey, p)
+		_, err := createWith(s, testKey, p)
 		if err == nil || errors.Is(err, ErrCleanupFailed) || s.signerCalls != 1 {
 			t.Fatalf("err=%v signerCalls=%d", err, s.signerCalls)
 		}
@@ -231,7 +231,7 @@ func TestCreateForService(t *testing.T) {
 	})
 }
 
-func TestDeleteForService(t *testing.T) {
+func TestDeleteContract(t *testing.T) {
 	p := mustServicePolicy(t, testServiceName)
 	other := mustServicePolicy(t, "Example.Policy.Other")
 	pub, spki := testP256(t)
@@ -258,7 +258,7 @@ func TestDeleteForService(t *testing.T) {
 
 	t.Run("verified key is deleted on the opened handle", func(t *testing.T) {
 		s := store(t)
-		if err := deleteForService(s, testKey, p, spki); err != nil {
+		if err := deleteWith(s, testKey, p, spki); err != nil {
 			t.Fatal(err)
 		}
 		if s.opens != 1 || len(s.deletedKeys) != 1 || len(s.creates) != 0 || len(s.writes) != 0 {
@@ -295,14 +295,14 @@ func TestDeleteForService(t *testing.T) {
 			run  func(*fakeStore) error
 			text string
 		}{
-			"empty name":                   {func(s *fakeStore) error { return deleteForService(s, "", p, spki) }, "key name is empty"},
-			"NUL in name":                  {func(s *fakeStore) error { return deleteForService(s, "a\x00b", p, spki) }, "NUL character"},
-			"invalid policy":               {func(s *fakeStore) error { return deleteForService(s, testKey, ServicePolicy{}, spki) }, ""},
-			"nil SPKI":                     {func(s *fakeStore) error { return deleteForService(s, testKey, p, nil) }, "is empty"},
-			"malformed SPKI":               {func(s *fakeStore) error { return deleteForService(s, testKey, p, []byte{0x30, 0x03, 0x01}) }, "not valid PKIX DER"},
-			"trailing data after the SPKI": {func(s *fakeStore) error { return deleteForService(s, testKey, p, trailing) }, "not valid PKIX DER"},
-			"RSA SPKI":                     {func(s *fakeStore) error { return deleteForService(s, testKey, p, rsaKey) }, "not an ECDSA P-256 key"},
-			"P-384 SPKI":                   {func(s *fakeStore) error { return deleteForService(s, testKey, p, p384Key) }, "not an ECDSA P-256 key"},
+			"empty name":                   {func(s *fakeStore) error { return deleteWith(s, "", p, spki) }, "key name is empty"},
+			"NUL in name":                  {func(s *fakeStore) error { return deleteWith(s, "a\x00b", p, spki) }, "NUL character"},
+			"invalid policy":               {func(s *fakeStore) error { return deleteWith(s, testKey, ServicePolicy{}, spki) }, ""},
+			"nil SPKI":                     {func(s *fakeStore) error { return deleteWith(s, testKey, p, nil) }, "is empty"},
+			"malformed SPKI":               {func(s *fakeStore) error { return deleteWith(s, testKey, p, []byte{0x30, 0x03, 0x01}) }, "not valid PKIX DER"},
+			"trailing data after the SPKI": {func(s *fakeStore) error { return deleteWith(s, testKey, p, trailing) }, "not valid PKIX DER"},
+			"RSA SPKI":                     {func(s *fakeStore) error { return deleteWith(s, testKey, p, rsaKey) }, "not an ECDSA P-256 key"},
+			"P-384 SPKI":                   {func(s *fakeStore) error { return deleteWith(s, testKey, p, p384Key) }, "not an ECDSA P-256 key"},
 		} {
 			s := store(t)
 			s.privileged = false // an input error must come before the token check
@@ -344,7 +344,7 @@ func TestDeleteForService(t *testing.T) {
 		}
 		s := store(t)
 		s.privileged = false
-		if err := deleteForService(s, testKey, p, extra); err == nil || errors.Is(err, ErrPrivilegeRequired) || s.privilegeChecks != 0 || s.opens != 0 {
+		if err := deleteWith(s, testKey, p, extra); err == nil || errors.Is(err, ErrPrivilegeRequired) || s.privilegeChecks != 0 || s.opens != 0 {
 			t.Fatalf("err=%v privilegeChecks=%d opens=%d, want an input error before any native call", err, s.privilegeChecks, s.opens)
 		}
 		assertKept(t, s)
@@ -352,7 +352,7 @@ func TestDeleteForService(t *testing.T) {
 	t.Run("non-privileged caller: nothing opened or deleted", func(t *testing.T) {
 		s := store(t)
 		s.privileged = false
-		if err := deleteForService(s, testKey, p, spki); !errors.Is(err, ErrPrivilegeRequired) {
+		if err := deleteWith(s, testKey, p, spki); !errors.Is(err, ErrPrivilegeRequired) {
 			t.Fatalf("err = %v, want ErrPrivilegeRequired", err)
 		}
 		if s.opens != 0 {
@@ -363,7 +363,7 @@ func TestDeleteForService(t *testing.T) {
 	t.Run("open failure is returned unchanged", func(t *testing.T) {
 		s := store(t)
 		delete(s.persisted, testKey)
-		err := deleteForService(s, testKey, p, spki)
+		err := deleteWith(s, testKey, p, spki)
 		if !errors.Is(err, ErrKeyNotFound) || errors.Is(err, ErrDeleteVerificationFailed) {
 			t.Fatalf("err = %v, want ErrKeyNotFound only", err)
 		}
@@ -389,7 +389,7 @@ func TestDeleteForService(t *testing.T) {
 		t.Run("verification fails, nothing deleted: "+name, func(t *testing.T) {
 			s := store(t)
 			tc.setup(s)
-			err := deleteForService(s, testKey, p, tc.spki)
+			err := deleteWith(s, testKey, p, tc.spki)
 			if !errors.Is(err, ErrDeleteVerificationFailed) {
 				t.Fatalf("err = %v, want ErrDeleteVerificationFailed", err)
 			}
@@ -405,7 +405,7 @@ func TestDeleteForService(t *testing.T) {
 	t.Run("delete itself fails: delete error, handle released once", func(t *testing.T) {
 		s := store(t)
 		s.deleteErr = ncryptStatusError("NCryptDeleteKey", NTEPerm)
-		err := deleteForService(s, testKey, p, spki)
+		err := deleteWith(s, testKey, p, spki)
 		if err == nil || errors.Is(err, ErrDeleteVerificationFailed) || errors.Is(err, ErrCleanupFailed) || !strings.Contains(err.Error(), "delete key") {
 			t.Fatalf("err = %v, want the delete failure only", err)
 		}

@@ -39,56 +39,24 @@ const (
 // daclSecurityInformation requests only the DACL portion of a security descriptor.
 const daclSecurityInformation = 0x00000004
 
-// SDDL security descriptor for machine-scoped CNG keys.
-//
-// Principals:
+// keySecuritySDDL is the protected DACL requested for PolicyServiceSigner
+// keys, identical in every release since v0.1.0:
 //
 //	SY (SYSTEM):           GA  (GENERIC_ALL) — administrative/system access
 //	BA (Administrators):   GA  (GENERIC_ALL) — administrative/repair access
 //	LS (LOCAL SERVICE):    GRGX (GENERIC_READ | GENERIC_EXECUTE) — requested service access
 //
-// The Microsoft Software KSP may canonicalize the persisted generic mask. In
-// manual Windows proof, the LOCAL SERVICE ACE persisted as GENERIC_READ only.
-// Provisioning requests this restrictive DACL policy. Validation checks the
-// required principals and rejects specific disallowed principals, but it does
-// not establish an exclusive allow-list or fully evaluate owner, inheritance,
-// every additional ACE, or Windows effective access. LOCAL SERVICE is a shared
-// Windows service identity; this policy does not by itself isolate one LOCAL
-// SERVICE process from another.
-//
-// The SDDL string requests no allow ACE for ordinary interactive users (no WD,
-// AU, IU, BU ACE).
+// The Microsoft Software KSP may canonicalize the persisted generic mask (in
+// manual Windows proof the LOCAL SERVICE ACE persisted as GENERIC_READ only);
+// classifyDescriptorSID accepts exactly the observed forms. LOCAL SERVICE is a
+// shared Windows service identity: this policy does not by itself isolate one
+// LOCAL SERVICE process from another; a ServicePolicy does.
 const keySecuritySDDL = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;LS)"
 
 // privilegedOnlySDDL is the protected DACL requested for PolicyPrivilegedOnly
 // keys (for example a local CA key): SYSTEM and Administrators only, with no
 // LOCAL SERVICE or any other allow ACE.
 const privilegedOnlySDDL = "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
-
-// The generic access masks and well-known SID strings used for structural ACL
-// verification are declared in acl_constants.go so the platform-neutral
-// descriptor classifier in sd.go can share them.
-
-// aceHeader mirrors the ACE_HEADER from Windows SDK.
-type aceHeader struct {
-	AceType  byte
-	AceFlags byte
-	AceSize  uint16
-}
-
-// accessAllowedAce mirrors ACCESS_ALLOWED_ACE from Windows SDK.
-type accessAllowedAce struct {
-	Header aceHeader
-	Mask   uint32
-	// SidStart follows in memory.
-}
-
-// aclSizeInfo mirrors ACL_SIZE_INFORMATION from Windows SDK.
-type aclSizeInfo struct {
-	AceCount      uint32
-	AclBytesInUse uint32
-	AclBytesFree  uint32
-}
 
 var (
 	// ncrypt.dll and advapi32.dll are bound from the system directory only;
@@ -107,10 +75,6 @@ var (
 
 	advapi32                                                 = newSystemDLL("advapi32.dll")
 	procConvertStringSecurityDescriptorToSecurityDescriptorW = advapi32.NewProc("ConvertStringSecurityDescriptorToSecurityDescriptorW")
-	procGetSecurityDescriptorDacl                            = advapi32.NewProc("GetSecurityDescriptorDacl")
-	procGetAclInformation                                    = advapi32.NewProc("GetAclInformation")
-	procGetAce                                               = advapi32.NewProc("GetAce")
-	procEqualSid                                             = advapi32.NewProc("EqualSid")
 	procConvertStringSidToSidW                               = advapi32.NewProc("ConvertStringSidToSidW")
 	procLocalFree                                            = kernel32.NewProc("LocalFree")
 )
@@ -122,47 +86,8 @@ const msSoftwareKSP = "Microsoft Software Key Storage Provider"
 // ECDSA P-256 signing key.
 const ecdsaP256Algorithm = "ECDSA_P256"
 
-// deleteKeyOpenFlags are the NCryptOpenKey flags used when opening a key for
-// deletion: machine scope with silent operation. No create fallback is used.
-const deleteKeyOpenFlags = ncryptMachineKeyFlag | ncryptSilentFlag
-
 // openKeyFlags are the NCryptOpenKey flags used when opening an existing key.
 const openKeyFlags = ncryptMachineKeyFlag | ncryptSilentFlag
-
-// Open opens the existing persisted machine-scoped key named name without
-// creating a replacement. It returns an error wrapping ErrKeyNotFound when the
-// native open reports the key as not found or not accessible (see
-// ErrKeyNotFound), and another error for other open failures or when the key
-// fails security validation. Successful Open means the key passed the
-// validation implemented by this module; it is not a certification of the
-// key's complete Windows effective-access policy.
-func Open(name string) (Signer, error) {
-	return openKey(name)
-}
-
-// LoadOrCreate first attempts to open the existing persisted machine-scoped key
-// named name. After a successful native open, it returns a signer only if key
-// validation and public-key loading also succeed. The key must be non-exportable,
-// machine-scoped ECDSA P-256 in the Microsoft Software Key Storage Provider.
-// If the native open operation fails, it attempts creation
-// without first classifying every possible open failure as "not found". Callers
-// that need to distinguish an absent key from an inaccessible or otherwise
-// failing key should not treat LoadOrCreate as proof that the key was absent. If
-// the subsequent creation attempt also fails, the returned error can describe
-// that creation failure rather than the original open failure.
-func LoadOrCreate(name string) (Signer, error) {
-	return loadOrCreateKey(name)
-}
-
-// Delete removes exactly the persisted machine-scoped CNG key named name. It
-// never creates a key and never performs wildcard/prefix enumeration or
-// deletion. It returns an error wrapping ErrKeyNotFound when the native open
-// reports the key as not found or not accessible, and deletes nothing. That
-// means "nothing deleted by this call"; for no caller does it prove that the
-// key was removed or is absent.
-func Delete(name string) error {
-	return deleteKey(name)
-}
 
 // deleteCNGKeyHandle enforces NCryptDeleteKey handle-ownership semantics using
 // injected delete/free operations. It is a seam that isolates the ownership
@@ -211,15 +136,11 @@ func ncryptStatus(r, _ uintptr, _ error) uint32 {
 	return uint32(r)
 }
 
-// win32BOOL reports whether the Win32 BOOL returned by a call is TRUE, used as
-// win32BOOL(proc.Call(...)). BOOL is a 32-bit int: only the low 32 bits of the
-// return register are defined, zero is FALSE and any other value is TRUE.
-func win32BOOL(r, _ uintptr, _ error) bool {
-	return uint32(r) != 0
-}
-
-// win32BOOLAndCallErr is win32BOOL for a caller that also reports the
-// Proc.Call last error, which a Win32 function returning FALSE sets.
+// win32BOOLAndCallErr reports whether the Win32 BOOL returned by a call is
+// TRUE, used as win32BOOLAndCallErr(proc.Call(...)), together with the
+// Proc.Call last error, which a Win32 function returning FALSE sets. BOOL is a
+// 32-bit int: only the low 32 bits of the return register are defined, zero is
+// FALSE and any other value is TRUE.
 func win32BOOLAndCallErr(r, _ uintptr, err error) (bool, error) {
 	return uint32(r) != 0, err
 }
@@ -262,203 +183,6 @@ func convertStringSid(sidString string) (unsafe.Pointer, error) {
 		return nil, withCauses(fmt.Sprintf("ConvertStringSidToSidW(%s): %v", sidString, err), win32Cause(err))
 	}
 	return sidPtr, nil
-}
-
-func aceSid(ace *accessAllowedAce) unsafe.Pointer {
-	return unsafe.Pointer(uintptr(unsafe.Pointer(ace)) + unsafe.Offsetof(ace.Mask) + unsafe.Sizeof(ace.Mask))
-}
-
-// verifyDACL checks the required principals and rejects specific disallowed
-// principals in the persisted DACL. It does not establish an exclusive
-// allow-list or fully evaluate owner, inheritance, every additional ACE, or
-// Windows effective access. It does not infer LOCAL SERVICE signing capability
-// from a particular serialized generic execute bit.
-func verifyDACL(keyHandle uintptr) error {
-	buf, err := getSecurityDescriptor(keyHandle)
-	if err != nil {
-		return err
-	}
-	return verifyDescriptorDACL(buf)
-}
-
-// verifyDescriptorDACL is verifyDACL on an already read self-relative security
-// descriptor. After the read it uses only in-memory Win32 calls, so it needs
-// loadNativeAPIs but no key.
-func verifyDescriptorDACL(buf []byte) error {
-	if len(buf) == 0 {
-		return fmt.Errorf("persisted security descriptor is empty")
-	}
-
-	var daclPresent int32
-	var daclDefaulted int32
-	var daclPtr unsafe.Pointer
-	// The last error is read only on failure, from the same Proc.Call.
-	ok, callErr := win32BOOLAndCallErr(procGetSecurityDescriptorDacl.Call(
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(unsafe.Pointer(&daclPresent)),
-		uintptr(unsafe.Pointer(&daclPtr)),
-		uintptr(unsafe.Pointer(&daclDefaulted)),
-	))
-	if !ok {
-		return withCauses("GetSecurityDescriptorDacl failed", win32Cause(callErr))
-	}
-	if daclPresent == 0 || daclPtr == nil {
-		return fmt.Errorf("persisted DACL is NULL — key has no access control")
-	}
-
-	var aclInfo aclSizeInfo
-	ok, callErr = win32BOOLAndCallErr(procGetAclInformation.Call(
-		uintptr(daclPtr),
-		uintptr(unsafe.Pointer(&aclInfo)),
-		uintptr(unsafe.Sizeof(aclInfo)),
-		uintptr(aclSizeInfoClass),
-	))
-	if !ok {
-		return withCauses("GetAclInformation failed", win32Cause(callErr))
-	}
-	if aclInfo.AceCount == 0 {
-		return fmt.Errorf("persisted DACL has zero ACEs — key is inaccessible")
-	}
-
-	freeSid := func(p unsafe.Pointer) {
-		if p != nil {
-			procLocalFree.Call(uintptr(p))
-		}
-	}
-
-	sidSYSTEMp, err := convertStringSid(sidSYSTEM)
-	if err != nil {
-		return err
-	}
-	defer freeSid(sidSYSTEMp)
-	sidAdminp, err := convertStringSid(sidAdministrators)
-	if err != nil {
-		return err
-	}
-	defer freeSid(sidAdminp)
-	sidLSp, err := convertStringSid(sidLocalService)
-	if err != nil {
-		return err
-	}
-	defer freeSid(sidLSp)
-	sidWDp, err := convertStringSid(sidEveryone)
-	if err != nil {
-		return err
-	}
-	defer freeSid(sidWDp)
-	sidAUp, err := convertStringSid(sidAuthUsers)
-	if err != nil {
-		return err
-	}
-	defer freeSid(sidAUp)
-	sidBUp, err := convertStringSid(sidBuiltinUsers)
-	if err != nil {
-		return err
-	}
-	defer freeSid(sidBUp)
-	sidIUp, err := convertStringSid(sidInteractive)
-	if err != nil {
-		return err
-	}
-	defer freeSid(sidIUp)
-	sidSUp, err := convertStringSid(sidService)
-	if err != nil {
-		return err
-	}
-	defer freeSid(sidSUp)
-	sidANp, err := convertStringSid(sidAnonymous)
-	if err != nil {
-		return err
-	}
-	defer freeSid(sidANp)
-
-	var foundSys, foundAdm, foundLS bool
-	for i := uint32(0); i < aclInfo.AceCount; i++ {
-		var acePtr unsafe.Pointer
-		ok, callErr := win32BOOLAndCallErr(procGetAce.Call(
-			uintptr(daclPtr),
-			uintptr(i),
-			uintptr(unsafe.Pointer(&acePtr)),
-		))
-		if !ok {
-			return withCauses(fmt.Sprintf("GetAce(%d) failed", i), win32Cause(callErr))
-		}
-
-		ace := (*accessAllowedAce)(acePtr)
-		if ace.Header.AceType != aceTypeAccessAllowed {
-			continue
-		}
-
-		sid := aceSid(ace)
-		generic := ace.Mask & genericRights
-
-		if matchSid(sid, sidWDp) {
-			return fmt.Errorf("persisted DACL contains forbidden allow ACE for Everyone")
-		}
-		if matchSid(sid, sidAUp) {
-			return fmt.Errorf("persisted DACL contains forbidden allow ACE for Authenticated Users")
-		}
-		if matchSid(sid, sidBUp) {
-			return fmt.Errorf("persisted DACL contains forbidden allow ACE for Built-in Users")
-		}
-		if matchSid(sid, sidIUp) {
-			return fmt.Errorf("persisted DACL contains forbidden allow ACE for Interactive Users")
-		}
-		if matchSid(sid, sidSUp) {
-			return fmt.Errorf("persisted DACL contains forbidden allow ACE for Service")
-		}
-		if matchSid(sid, sidANp) {
-			return fmt.Errorf("persisted DACL contains forbidden allow ACE for Anonymous")
-		}
-
-		if matchSid(sid, sidSYSTEMp) {
-			if foundSys {
-				return fmt.Errorf("duplicate allow ACE for SYSTEM")
-			}
-			foundSys = true
-			if generic&genericAll == 0 {
-				return fmt.Errorf("SYSTEM ACE generic mask 0x%08X lacks GENERIC_ALL bit (0x%08X)", generic, genericAll)
-			}
-		}
-
-		if matchSid(sid, sidAdminp) {
-			if foundAdm {
-				return fmt.Errorf("duplicate allow ACE for Administrators")
-			}
-			foundAdm = true
-			if generic&genericAll == 0 {
-				return fmt.Errorf("Administrators ACE generic mask 0x%08X lacks GENERIC_ALL bit (0x%08X)", generic, genericAll)
-			}
-		}
-
-		if matchSid(sid, sidLSp) {
-			if foundLS {
-				return fmt.Errorf("duplicate allow ACE for LOCAL SERVICE")
-			}
-			foundLS = true
-			// The Software KSP canonicalized the requested GR|GX ACE to GR in
-			// the real Windows proof. Require GENERIC_READ and reject
-			// GENERIC_WRITE and GENERIC_ALL. Other access-mask bits are not
-			// checked here; effective open or signing access is not established.
-			if generic&genericRead == 0 {
-				return fmt.Errorf("LOCAL SERVICE ACE generic mask 0x%08X lacks GENERIC_READ", generic)
-			}
-			if generic&genericWrite != 0 || generic&genericAll != 0 {
-				return fmt.Errorf("LOCAL SERVICE ACE generic mask 0x%08X grants administrative/write access", generic)
-			}
-		}
-	}
-
-	if !foundSys {
-		return fmt.Errorf("persisted DACL missing expected allow ACE for SYSTEM")
-	}
-	if !foundAdm {
-		return fmt.Errorf("persisted DACL missing expected allow ACE for Administrators")
-	}
-	if !foundLS {
-		return fmt.Errorf("persisted DACL missing expected allow ACE for LOCAL SERVICE")
-	}
-	return nil
 }
 
 // ncryptGetPropertyFunc runs one NCryptGetProperty of property on key. With
@@ -541,10 +265,6 @@ func setSecurityDescriptor(keyHandle uintptr, sd []byte) error {
 	return nil
 }
 
-func matchSid(s1, s2 unsafe.Pointer) bool {
-	return win32BOOL(procEqualSid.Call(uintptr(s1), uintptr(s2)))
-}
-
 func verifyExportPolicy(keyHandle uintptr) error {
 	return verifyExportPolicyWith(keyHandle, nativeGetProperty)
 }
@@ -566,16 +286,6 @@ func verifyExportPolicyWith(keyHandle uintptr, get ncryptGetPropertyFunc) error 
 	forbidden := uint32(ncryptAllowExportFlag | ncryptAllowPlaintextExportFlag | ncryptAllowArchivingFlag | ncryptAllowPlaintextArchivingFlag)
 	if actualPolicy&forbidden != 0 {
 		return fmt.Errorf("export policy permits forbidden export/archiving (actual=0x%x)", actualPolicy)
-	}
-	return nil
-}
-
-func validatePersistedKey(keyHandle uintptr) error {
-	if err := verifyExportPolicy(keyHandle); err != nil {
-		return err
-	}
-	if err := verifyDACL(keyHandle); err != nil {
-		return fmt.Errorf("persisted DACL verification failed: %w", err)
 	}
 	return nil
 }
@@ -635,194 +345,6 @@ func ncryptOpenKey(provider uintptr, nameUTF16 *uint16, flags uint32) (uintptr, 
 		uintptr(flags),
 	))
 	return keyHandle, r
-}
-
-// deleteKey deletes exactly one persisted CNG key by its exact name. It never
-// creates a key and never performs wildcard/prefix deletion.
-//
-// NCryptDeleteKey handle ownership is preserved: on success the key handle has
-// been freed by NCryptDeleteKey and must not be freed again; on failure the
-// caller still owns the handle and frees it explicitly. The provider handle is
-// always released.
-func deleteKey(name string) error {
-	provider, err := openProvider()
-	if err != nil {
-		return err
-	}
-	defer procNCryptFreeObject.Call(provider)
-
-	nameUTF16, err := syscall.UTF16PtrFromString(name)
-	if err != nil {
-		return fmt.Errorf("convert key name: %w", err)
-	}
-
-	keyHandle, r := ncryptOpenKey(provider, nameUTF16, deleteKeyOpenFlags)
-	if r != 0 {
-		return openKeyStatusError(name, r, " (for delete)")
-	}
-
-	if err := deleteKeyHandle(keyHandle); err != nil {
-		return fmt.Errorf("delete key %q: %w", name, err)
-	}
-	return nil
-}
-
-// legacyKeyOps is the set of native operations performed by Open and
-// LoadOrCreate. Production code uses nativeLegacyKeyOps; unit tests inject a
-// simulated backend so that the handle-ownership and cleanup control flow can
-// be verified without touching any real persisted CNG key.
-type legacyKeyOps interface {
-	// openProvider opens the Microsoft Software KSP. The caller owns the
-	// returned provider handle.
-	openProvider() (uintptr, error)
-	// openKey runs NCryptOpenKey for the exact name and returns the key
-	// handle and the native 32-bit status (0 on success).
-	openKey(provider uintptr, nameUTF16 *uint16) (keyHandle uintptr, hr uint32)
-	// createKey creates and finalizes a new key without overwrite (see
-	// createPersistedKey). On failure it has already released or deleted what
-	// it created and returns a zero handle.
-	createKey(provider uintptr, nameUTF16 *uint16) (uintptr, error)
-	// validate checks the export policy and persisted DACL of a key handle.
-	validate(keyHandle uintptr) error
-	// newSigner exports the public key and builds a signer that owns provider
-	// and keyHandle. On failure ownership of both handles stays with the caller.
-	newSigner(provider, keyHandle uintptr, name string) (Signer, error)
-	// deleteAndRelease deletes the key identified by keyHandle, with the handle
-	// contract of deleteKeyHandle: success consumes the handle, failure
-	// frees it once. It never looks the key up by name.
-	deleteAndRelease(keyHandle uintptr) error
-	// free runs NCryptFreeObject on a provider or key handle.
-	free(h uintptr)
-}
-
-// nativeLegacyKeyOps calls ncrypt.dll.
-type nativeLegacyKeyOps struct{}
-
-func (nativeLegacyKeyOps) openProvider() (uintptr, error) { return openProvider() }
-
-func (nativeLegacyKeyOps) openKey(provider uintptr, nameUTF16 *uint16) (uintptr, uint32) {
-	return ncryptOpenKey(provider, nameUTF16, openKeyFlags)
-}
-
-func (nativeLegacyKeyOps) createKey(provider uintptr, nameUTF16 *uint16) (uintptr, error) {
-	return createPersistedKey(provider, nameUTF16, keySecuritySDDL)
-}
-
-func (nativeLegacyKeyOps) validate(keyHandle uintptr) error {
-	return validatePersistedKey(keyHandle)
-}
-
-func (nativeLegacyKeyOps) newSigner(provider, keyHandle uintptr, name string) (Signer, error) {
-	s, err := newCNGSigner(provider, keyHandle, name)
-	if err != nil {
-		return nil, err
-	}
-	return s, nil
-}
-
-func (nativeLegacyKeyOps) deleteAndRelease(keyHandle uintptr) error {
-	return deleteKeyHandle(keyHandle)
-}
-
-func (nativeLegacyKeyOps) free(h uintptr) { procNCryptFreeObject.Call(h) }
-
-// openKey opens an existing persisted key and never creates it.
-// On successful return, the cngSigner owns both the provider and key handles.
-func openKey(name string) (Signer, error) {
-	return openKeyWith(nativeLegacyKeyOps{}, name)
-}
-
-func openKeyWith(ops legacyKeyOps, name string) (Signer, error) {
-	provider, err := ops.openProvider()
-	if err != nil {
-		return nil, err
-	}
-
-	nameUTF16, err := syscall.UTF16PtrFromString(name)
-	if err != nil {
-		ops.free(provider)
-		return nil, fmt.Errorf("convert key name: %w", err)
-	}
-
-	keyHandle, r := ops.openKey(provider, nameUTF16)
-	if r != 0 {
-		ops.free(provider)
-		return nil, openKeyStatusError(name, r, "")
-	}
-
-	return signerForExistingKey(ops, provider, keyHandle, name)
-}
-
-// signerForExistingKey completes the open of a key that already existed: it
-// revalidates the key, because existing keys are security-sensitive state and
-// proximity or name knowledge is not trust, then builds the signer. The key
-// was not created by this call, so it is never deleted: on failure both
-// handles are freed here, once each. On success the signer owns both.
-func signerForExistingKey(ops legacyKeyOps, provider, keyHandle uintptr, name string) (Signer, error) {
-	if err := ops.validate(keyHandle); err != nil {
-		ops.free(keyHandle)
-		ops.free(provider)
-		return nil, fmt.Errorf("existing key %s failed security validation: %w", name, err)
-	}
-	signer, err := ops.newSigner(provider, keyHandle, name)
-	if err != nil {
-		ops.free(keyHandle)
-		ops.free(provider)
-		return nil, err
-	}
-	return signer, nil
-}
-
-// loadOrCreateKey opens an existing persisted key or creates a new one.
-// On successful return, the cngSigner owns both the provider and key handles.
-func loadOrCreateKey(name string) (Signer, error) {
-	return loadOrCreateKeyWith(nativeLegacyKeyOps{}, name)
-}
-
-func loadOrCreateKeyWith(ops legacyKeyOps, name string) (Signer, error) {
-	provider, err := ops.openProvider()
-	if err != nil {
-		return nil, err
-	}
-
-	nameUTF16, err := syscall.UTF16PtrFromString(name)
-	if err != nil {
-		ops.free(provider)
-		return nil, fmt.Errorf("convert key name: %w", err)
-	}
-
-	keyHandle, r := ops.openKey(provider, nameUTF16)
-	if r == 0 {
-		// A key opened here was not created by this call: it is never deleted.
-		return signerForExistingKey(ops, provider, keyHandle, name)
-	}
-
-	// createKey never overwrites: a successful return proves that this call
-	// created the key behind keyHandle. On failure it has already handled its
-	// own cleanup, and nothing else may be deleted here.
-	keyHandle, err = ops.createKey(provider, nameUTF16)
-	if err != nil {
-		ops.free(provider)
-		return nil, err
-	}
-
-	if err := ops.validate(keyHandle); err != nil {
-		err = cleanupCreatedKey(err, func() error { return ops.deleteAndRelease(keyHandle) })
-		ops.free(provider)
-		return nil, fmt.Errorf("created key %q failed security validation: %w", name, err)
-	}
-
-	signer, err := ops.newSigner(provider, keyHandle, name)
-	if err != nil {
-		// The key was created by this call and the signer did not take the
-		// handles: delete it through the same handle, never by name. The
-		// delete consumes keyHandle on success and frees it on failure, so it
-		// must not be freed again here; only the provider remains to release.
-		err = cleanupCreatedKey(err, func() error { return ops.deleteAndRelease(keyHandle) })
-		ops.free(provider)
-		return nil, err
-	}
-	return signer, nil
 }
 
 // createKeyNative is the set of native operations performed by
@@ -926,7 +448,7 @@ func createPersistedKeyWith(ops createKeyNative, provider uintptr, nameUTF16 *ui
 		status := ncryptStatusError("NCryptCreatePersistedKey", r)
 		if r == NTEExists {
 			// Same text and NCryptError; the unexported marker only lets
-			// CreateForService tell this status from any later step.
+			// Create tell this status from any later step.
 			return 0, withCauses(status.Error(), status, errCreateCollision)
 		}
 		return 0, status

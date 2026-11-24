@@ -3,6 +3,7 @@
 package windowscng
 
 import (
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -193,10 +194,14 @@ func probeObserve(t *testing.T, cfg probeConfig, rec *probeRecord) {
 		rec.Details = append(rec.Details, fmt.Sprintf("control key %q already exists or cannot be checked (NCryptOpenKey hr=0x%x): not touched", control, hr))
 		rec.finish(t, cfg, outcomeInvalidObs)
 	}
-	s, err := LoadOrCreate(control)
+	s, err := Create(control, PolicyServiceSigner)
 	if err != nil {
 		rec.Details = append(rec.Details, fmt.Sprintf("create control key: %v", err))
 		rec.finish(t, cfg, outcomeInvalidObs)
+	}
+	controlSPKI, err := x509.MarshalPKIXPublicKey(s.Public())
+	if err != nil {
+		rec.Details = append(rec.Details, fmt.Sprintf("control key SPKI: %v", err))
 	}
 	if err := s.Close(); err != nil {
 		rec.Details = append(rec.Details, fmt.Sprintf("close control signer: %v", err))
@@ -212,7 +217,7 @@ func probeObserve(t *testing.T, cfg probeConfig, rec *probeRecord) {
 
 	// The control key is deleted and checked before the outcome is decided,
 	// so that the record always shows whether it is gone.
-	if err := Delete(control); err != nil {
+	if err := Delete(control, PolicyServiceSigner, controlSPKI); err != nil {
 		rec.Details = append(rec.Details, fmt.Sprintf("delete control key %q: %v", control, err))
 	}
 	gone := probeEnumMachineKeys(t)

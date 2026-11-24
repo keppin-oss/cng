@@ -7,6 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -24,7 +25,11 @@ import (
 // Every scenario uses its own fresh key name,
 // Keppin.OSS.Test.CNG.Policy.<scenario>.<16 random hex digits>, and deletes
 // only that exact name, and only if this test created it. Nothing is deleted
-// by prefix or by enumeration.
+// by prefix or by enumeration. A scenario deletes its key with the public
+// Delete, against the policy and SubjectPublicKeyInfo it recorded; the
+// cleanup of a scenario that stopped earlier, or whose key Delete must refuse
+// (an exportable key), deletes the exact name through the internal native
+// path instead.
 
 // smokeRequiredEnv, when set to 1, turns every unmet precondition of a smoke
 // test into a failure: with it set, no smoke test can skip.
@@ -54,6 +59,10 @@ type smokeKey struct {
 	// failed and nothing proves the key exists (exists).
 	created, exists, deleted bool
 	signers                  []Signer
+	// policy is the policy the key currently holds, and spki the
+	// SubjectPublicKeyInfo recorded at its creation: the inputs of Delete.
+	policy KeyPolicy
+	spki   []byte
 }
 
 // newSmokeKey checks the preconditions, before anything is created, and
@@ -89,7 +98,8 @@ func newSmokeKey(t *testing.T, scenario string, probe func(name string) (Signer,
 }
 
 // cleanup closes the signers first, then deletes the exact name if this test
-// created it. A failure fails the test and names the key to inspect by hand.
+// created it and did not delete it. A failure fails the test and names the key
+// to inspect by hand.
 func (k *smokeKey) cleanup() {
 	for _, s := range k.signers {
 		_ = s.Close()
@@ -97,9 +107,30 @@ func (k *smokeKey) cleanup() {
 	if !k.created || k.deleted {
 		return
 	}
-	if err := Delete(k.name); err != nil {
-		k.t.Errorf("cleanup: Delete(%q) = %v: inspect and remove this exact key by hand", k.name, err)
+	if err := smokeDeleteExact(k.name); err != nil {
+		k.t.Errorf("cleanup: delete %q = %v: inspect and remove this exact key by hand", k.name, err)
 	}
+}
+
+// smokeDeleteExact deletes the exact test key name through the internal
+// native path, without the checks of Delete: it opens the name and deletes
+// through that same handle. It is used only for keys this test created.
+func smokeDeleteExact(name string) error {
+	sk, err := nativeKeyStore{}.open(name)
+	if err != nil {
+		return err
+	}
+	return sk.deleteAndRelease()
+}
+
+// smokeSPKI returns the DER SubjectPublicKeyInfo of s, the form Delete expects.
+func smokeSPKI(t *testing.T, step string, s Signer) []byte {
+	t.Helper()
+	der, err := x509.MarshalPKIXPublicKey(s.Public())
+	if err != nil {
+		t.Fatalf("%s: MarshalPKIXPublicKey = %v", step, err)
+	}
+	return der
 }
 
 // track registers a signer so that cleanup closes it. Close is idempotent.
@@ -123,26 +154,25 @@ func (k *smokeKey) afterCreate(err error) {
 	}
 }
 
-func (k *smokeKey) loadOrCreate(policy Policy) Signer {
+// create creates the key with policy and records the policy and the
+// SubjectPublicKeyInfo of the new key.
+func (k *smokeKey) create(policy KeyPolicy) Signer {
 	k.t.Helper()
 	k.created = true
-	s, err := LoadOrCreateWithPolicy(k.name, policy)
+	s, err := Create(k.name, policy)
 	k.afterCreate(err)
 	if err != nil {
-		k.t.Fatalf("LoadOrCreateWithPolicy(%v) = %v", policy, err)
+		k.t.Fatalf("Create(%v) = %v", policy, err)
 	}
+	k.policy, k.spki = policy, smokeSPKI(k.t, "Create", s)
 	return k.track(s)
 }
 
-func (k *smokeKey) loadOrCreateForService(policy ServicePolicy) Signer {
+// apply runs Apply, which must succeed, and records the new policy.
+func (k *smokeKey) apply(step string, policy KeyPolicy) {
 	k.t.Helper()
-	k.created = true
-	s, err := LoadOrCreateForService(k.name, policy)
-	k.afterCreate(err)
-	if err != nil {
-		k.t.Fatalf("LoadOrCreateForService(%v) = %v", policy, err)
-	}
-	return k.track(s)
+	k.mustNil(step, Apply(k.name, policy))
+	k.policy = policy
 }
 
 // openOK opens with open, which must succeed.
@@ -187,11 +217,11 @@ func (k *smokeKey) openFailsNotAbsent(step string, open func() (Signer, error)) 
 }
 
 func (k *smokeKey) withPolicy(p Policy) func() (Signer, error) {
-	return func() (Signer, error) { return OpenWithPolicy(k.name, p) }
+	return func() (Signer, error) { return Open(k.name, p) }
 }
 
 func (k *smokeKey) forService(p ServicePolicy) func() (Signer, error) {
-	return func() (Signer, error) { return OpenForService(k.name, p) }
+	return func() (Signer, error) { return Open(k.name, p) }
 }
 
 // release closes a signer and requires Close to succeed.
@@ -202,11 +232,13 @@ func (k *smokeKey) release(step string, s Signer) {
 	}
 }
 
-// deleteAndConfirm deletes the exact name and confirms that open reports it absent.
+// deleteAndConfirm deletes the exact name with the public Delete, against the
+// recorded policy and SubjectPublicKeyInfo, and confirms that open reports it
+// absent.
 func (k *smokeKey) deleteAndConfirm(open func() (Signer, error)) {
 	k.t.Helper()
-	if err := Delete(k.name); err != nil {
-		k.t.Fatalf("Delete = %v", err)
+	if err := Delete(k.name, k.policy, k.spki); err != nil {
+		k.t.Fatalf("Delete(%v) = %v", k.policy, err)
 	}
 	k.deleted = true
 	k.openIs("open after Delete", ErrKeyNotFound, open)
@@ -283,11 +315,11 @@ func smokeSameDACL(t *testing.T, step string, before, after []byte) {
 }
 
 func policyProbe(p Policy) func(string) (Signer, error) {
-	return func(name string) (Signer, error) { return OpenWithPolicy(name, p) }
+	return func(name string) (Signer, error) { return Open(name, p) }
 }
 
 func serviceProbe(p ServicePolicy) func(string) (Signer, error) {
-	return func(name string) (Signer, error) { return OpenForService(name, p) }
+	return func(name string) (Signer, error) { return Open(name, p) }
 }
 
 func smokeServicePolicy(t *testing.T, service string) ServicePolicy {
@@ -303,41 +335,73 @@ func smokeServicePolicy(t *testing.T, service string) ServicePolicy {
 func TestSmokePolicyGeneric(t *testing.T) {
 	k := newSmokeKey(t, "A", policyProbe(PolicyServiceSigner))
 
+	// 0. an Open of the absent name never creates it.
+	k.openIs("A0 Open(PolicyServiceSigner) on the absent name", ErrKeyNotFound, k.withPolicy(PolicyServiceSigner))
+	k.openIs("A0 Open again: still absent", ErrKeyNotFound, k.withPolicy(PolicyServiceSigner))
+
 	// 1. create, sign, verify.
-	s := k.loadOrCreate(PolicyServiceSigner)
+	s := k.create(PolicyServiceSigner)
 	pub := smokeSignVerify(t, "A1", s)
 	k.release("A1", s)
 
 	// 2. open with the same policy.
-	s = k.openOK("A2 OpenWithPolicy(PolicyServiceSigner)", k.withPolicy(PolicyServiceSigner))
+	s = k.openOK("A2 Open(PolicyServiceSigner)", k.withPolicy(PolicyServiceSigner))
 	k.release("A2", s)
 
 	// 3. the other policy does not match yet.
-	k.openIs("A3 OpenWithPolicy(PolicyPrivilegedOnly)", ErrPolicyMismatch, k.withPolicy(PolicyPrivilegedOnly))
+	k.openIs("A3 Open(PolicyPrivilegedOnly)", ErrPolicyMismatch, k.withPolicy(PolicyPrivilegedOnly))
 
-	// 4. tighten, and again (idempotent).
-	k.mustNil("A4 ApplyPolicy(PolicyPrivilegedOnly)", ApplyPolicy(k.name, PolicyPrivilegedOnly))
-	k.mustNil("A4 ApplyPolicy(PolicyPrivilegedOnly) again", ApplyPolicy(k.name, PolicyPrivilegedOnly))
-
-	// 5. the tightened key opens, with the same public key.
-	s = k.openOK("A5 OpenWithPolicy(PolicyPrivilegedOnly)", k.withPolicy(PolicyPrivilegedOnly))
-	smokeSamePublic(t, "A5", s, pub)
-	k.release("A5", s)
-
-	// 6. the old policy no longer matches.
-	k.openIs("A6 OpenWithPolicy(PolicyServiceSigner)", ErrPolicyMismatch, k.withPolicy(PolicyServiceSigner))
-
-	// 7. widening is refused, and the DACL is unchanged.
+	// 4. a Create on the existing name fails with ErrKeyExists and leaves the
+	// key untouched.
 	before := smokeDACL(t, k.name)
-	k.mustBe("A7 ApplyPolicy(PolicyServiceSigner)", ErrPolicyMismatch, ApplyPolicy(k.name, PolicyServiceSigner))
-	smokeSameDACL(t, "A7", before, smokeDACL(t, k.name))
-	s = k.openOK("A7 OpenWithPolicy(PolicyPrivilegedOnly) after the refused widening", k.withPolicy(PolicyPrivilegedOnly))
-	k.release("A7", s)
+	created, err := Create(k.name, PolicyServiceSigner)
+	k.track(created)
+	if created != nil || !errors.Is(err, ErrKeyExists) {
+		t.Fatalf("A4 Create on the existing name = (%v, %v), want no signer and ErrKeyExists", created, err)
+	}
+	smokeSameDACL(t, "A4", before, smokeDACL(t, k.name))
+	s = k.openOK("A4 Open(PolicyServiceSigner) after the refused create", k.withPolicy(PolicyServiceSigner))
+	smokeSamePublic(t, "A4", s, pub)
+	k.release("A4", s)
 
-	// 8. the legacy Open needs the LOCAL SERVICE entry and refuses the key, which exists.
-	k.openFailsNotAbsent("A8 Open", func() (Signer, error) { return Open(k.name) })
+	// 5. tighten, and again (idempotent).
+	k.apply("A5 Apply(PolicyPrivilegedOnly)", PolicyPrivilegedOnly)
+	k.apply("A5 Apply(PolicyPrivilegedOnly) again", PolicyPrivilegedOnly)
 
-	// 9. delete.
+	// 6. the tightened key opens, with the same public key.
+	s = k.openOK("A6 Open(PolicyPrivilegedOnly)", k.withPolicy(PolicyPrivilegedOnly))
+	smokeSamePublic(t, "A6", s, pub)
+	k.release("A6", s)
+
+	// 7. the old policy no longer matches.
+	k.openIs("A7 Open(PolicyServiceSigner)", ErrPolicyMismatch, k.withPolicy(PolicyServiceSigner))
+
+	// 8. widening is refused, and the DACL is unchanged.
+	before = smokeDACL(t, k.name)
+	k.mustBe("A8 Apply(PolicyServiceSigner)", ErrPolicyMismatch, Apply(k.name, PolicyServiceSigner))
+	smokeSameDACL(t, "A8", before, smokeDACL(t, k.name))
+	s = k.openOK("A8 Open(PolicyPrivilegedOnly) after the refused widening", k.withPolicy(PolicyPrivilegedOnly))
+	k.release("A8", s)
+
+	// 9. a Delete with another SubjectPublicKeyInfo, or with a policy the key
+	// does not hold, deletes nothing.
+	other, err := ecdsa.GenerateKey(pub.Curve, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherSPKI, err := x509.MarshalPKIXPublicKey(&other.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k.mustBe("A9 Delete with another SPKI", ErrDeleteVerificationFailed, Delete(k.name, PolicyPrivilegedOnly, otherSPKI))
+	err = Delete(k.name, PolicyServiceSigner, k.spki)
+	k.mustBe("A9 Delete with another policy", ErrDeleteVerificationFailed, err)
+	k.mustBe("A9 Delete with another policy", ErrPolicyMismatch, err)
+	s = k.openOK("A9 Open(PolicyPrivilegedOnly) after the refused deletes", k.withPolicy(PolicyPrivilegedOnly))
+	smokeSamePublic(t, "A9", s, pub)
+	k.release("A9", s)
+
+	// 10. delete.
 	k.deleteAndConfirm(k.withPolicy(PolicyPrivilegedOnly))
 }
 
@@ -348,21 +412,21 @@ func TestSmokePolicyServiceSID(t *testing.T) {
 	k := newSmokeKey(t, "B", serviceProbe(svc))
 
 	// 1. create, sign, verify.
-	s := k.loadOrCreateForService(svc)
+	s := k.create(svc)
 	smokeSignVerify(t, "B1", s)
 	k.release("B1", s)
 
 	// 2. open for the service; the generic policy does not match.
-	s = k.openOK("B2 OpenForService", k.forService(svc))
+	s = k.openOK("B2 Open(service)", k.forService(svc))
 	k.release("B2", s)
-	k.openIs("B2 OpenWithPolicy(PolicyServiceSigner)", ErrPolicyMismatch, k.withPolicy(PolicyServiceSigner))
+	k.openIs("B2 Open(PolicyServiceSigner)", ErrPolicyMismatch, k.withPolicy(PolicyServiceSigner))
 
 	// 3. tighten; the service form no longer matches.
-	k.mustNil("B3 ApplyPolicy(PolicyPrivilegedOnly)", ApplyPolicy(k.name, PolicyPrivilegedOnly))
-	k.openIs("B3 OpenForService", ErrPolicyMismatch, k.forService(svc))
+	k.apply("B3 Apply(PolicyPrivilegedOnly)", PolicyPrivilegedOnly)
+	k.openIs("B3 Open(service)", ErrPolicyMismatch, k.forService(svc))
 
 	// 4. delete.
-	k.deleteAndConfirm(k.forService(svc))
+	k.deleteAndConfirm(k.withPolicy(PolicyPrivilegedOnly))
 }
 
 // TestSmokePolicyMigration is scenario C: from the generic LOCAL SERVICE key to
@@ -373,16 +437,16 @@ func TestSmokePolicyMigration(t *testing.T) {
 	k := newSmokeKey(t, "C", policyProbe(PolicyServiceSigner))
 
 	// 1. create with the generic policy.
-	s := k.loadOrCreate(PolicyServiceSigner)
+	s := k.create(PolicyServiceSigner)
 	k.release("C1", s)
 
 	// 2. migrate to the service.
-	k.mustNil("C2 ApplyServicePolicy", ApplyServicePolicy(k.name, svc))
-	s = k.openOK("C2 OpenForService", k.forService(svc))
+	k.apply("C2 Apply(service)", svc)
+	s = k.openOK("C2 Open(service)", k.forService(svc))
 	k.release("C2", s)
 
 	// 3. another service's policy is not a transition from this state.
-	k.mustBe("C3 ApplyServicePolicy(other service)", ErrPolicyMismatch, ApplyServicePolicy(k.name, other))
+	k.mustBe("C3 Apply(other service)", ErrPolicyMismatch, Apply(k.name, other))
 
 	// 4. delete.
 	k.deleteAndConfirm(k.forService(svc))
@@ -405,7 +469,7 @@ func (exportableCreateOps) setExportPolicyNone(keyHandle uintptr) uint32 {
 }
 
 // smokeCreateWith runs the internal create path of the package with ops on the
-// exact key name, with the DACL of the legacy profile. On success the caller
+// exact key name, with the DACL of PolicyServiceSigner. On success the caller
 // owns the returned key handle; the provider handle is always released.
 func smokeCreateWith(ops createKeyNative, name string) (uintptr, error) {
 	provider, err := openProvider()
@@ -438,21 +502,40 @@ func TestSmokePolicyExportableRejected(t *testing.T) {
 	}
 	procNCryptFreeObject.Call(h)
 
-	// 2. OpenWithPolicy refuses it: it exists, so not ErrKeyNotFound.
-	k.openFailsNotAbsent("D2 OpenWithPolicy(PolicyServiceSigner)", k.withPolicy(PolicyServiceSigner))
+	// 2. Open refuses it: it exists, so not ErrKeyNotFound.
+	k.openFailsNotAbsent("D2 Open(PolicyServiceSigner)", k.withPolicy(PolicyServiceSigner))
 
-	// 3. the legacy Open refuses it too.
-	k.openFailsNotAbsent("D3 Open", func() (Signer, error) { return Open(k.name) })
-
-	// 4. ApplyPolicy refuses it and does not touch the DACL.
+	// 3. Apply refuses it and does not touch the DACL.
 	before := smokeDACL(t, k.name)
-	if err := ApplyPolicy(k.name, PolicyPrivilegedOnly); err == nil {
-		t.Fatalf("D4 ApplyPolicy(PolicyPrivilegedOnly) = nil, want an error")
+	if err := Apply(k.name, PolicyPrivilegedOnly); err == nil {
+		t.Fatalf("D3 Apply(PolicyPrivilegedOnly) = nil, want an error")
 	}
+	smokeSameDACL(t, "D3", before, smokeDACL(t, k.name))
+
+	// 4. Delete refuses it too, whatever SubjectPublicKeyInfo is passed: the
+	// export policy is checked first.
+	sk, err := nativeKeyStore{}.open(k.name)
+	if err != nil {
+		t.Fatalf("D4 open %q to read its public key: %v", k.name, err)
+	}
+	pub, err := sk.publicKey()
+	sk.close()
+	if err != nil {
+		t.Fatalf("D4 public key of %q: %v", k.name, err)
+	}
+	spki, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k.mustBe("D4 Delete of the exportable key", ErrDeleteVerificationFailed, Delete(k.name, PolicyServiceSigner, spki))
 	smokeSameDACL(t, "D4", before, smokeDACL(t, k.name))
 
-	// 5. delete.
-	k.deleteAndConfirm(k.withPolicy(PolicyServiceSigner))
+	// 5. delete the exact name through the internal path.
+	if err := smokeDeleteExact(k.name); err != nil {
+		t.Fatalf("D5 delete = %v", err)
+	}
+	k.deleted = true
+	k.openIs("D5 open after the delete", ErrKeyNotFound, k.withPolicy(PolicyServiceSigner))
 }
 
 // TestSmokePolicyCreateExistingName is scenario E: what the Microsoft Software
@@ -463,7 +546,7 @@ func TestSmokePolicyCreateExistingName(t *testing.T) {
 	k := newSmokeKey(t, "E", policyProbe(PolicyServiceSigner))
 
 	// 1. create the original key and keep its public key.
-	s := k.loadOrCreate(PolicyServiceSigner)
+	s := k.create(PolicyServiceSigner)
 	pub := smokePublic(t, "E1", s)
 	k.release("E1", s)
 
@@ -498,7 +581,7 @@ func TestSmokePolicyCreateExistingName(t *testing.T) {
 	}
 
 	// 4. the original key is untouched.
-	s = k.openOK("E4 OpenWithPolicy(PolicyServiceSigner)", k.withPolicy(PolicyServiceSigner))
+	s = k.openOK("E4 Open(PolicyServiceSigner)", k.withPolicy(PolicyServiceSigner))
 	smokeSamePublic(t, "E4", s, pub)
 	k.release("E4", s)
 

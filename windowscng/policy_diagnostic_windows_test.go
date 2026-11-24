@@ -29,7 +29,7 @@ func TestCreatedKeyDiagnosticBeforeRollback(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s := newFakeStore(t)
 			s.privileged, s.writeResult = true, append([]byte(nil), sd...)
-			_, err := loadOrCreateForService(s, testKey, p)
+			_, err := createWith(s, testKey, p)
 			if !errors.Is(err, ErrPolicyMismatch) {
 				t.Fatalf("sentinel lost: %v", err)
 			}
@@ -53,7 +53,7 @@ func TestB3ServicePolicyEngine(t *testing.T) {
 	s := newFakeStore(t)
 	s.privileged = true
 	s.writeResult = observed
-	signer, err := loadOrCreateForService(s, testKey, p)
+	signer, err := createWith(s, testKey, p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,28 +62,23 @@ func TestB3ServicePolicyEngine(t *testing.T) {
 		t.Fatal("accepted creation rolled back")
 	}
 	assertHandlesReleased(t, s)
-	// Existing matching keys: open/load/idempotent apply must not change them.
+	// Existing matching keys: open and idempotent apply must not change them.
 	s = newFakeStore(t)
 	s.privileged = true
 	s.persisted[testKey] = observed
-	signer, err = openForService(s, testKey, p)
+	signer, err = openWith(s, testKey, p)
 	if err != nil {
 		t.Fatal(err)
 	}
 	signer.Close()
-	signer, err = loadOrCreateForService(s, testKey, p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer.Close()
-	if err := applyServicePolicy(s, testKey, p); err != nil {
+	if err := applyWith(s, testKey, p); err != nil {
 		t.Fatal(err)
 	}
 	other := mustServicePolicy(t, "Example.Other.Service")
-	if _, err := openForService(s, testKey, other); !errors.Is(err, ErrPolicyMismatch) {
+	if _, err := openWith(s, testKey, other); !errors.Is(err, ErrPolicyMismatch) {
 		t.Fatalf("other SID accepted: %v", err)
 	}
-	if err := applyServicePolicy(s, testKey, other); !errors.Is(err, ErrPolicyMismatch) {
+	if err := applyWith(s, testKey, other); !errors.Is(err, ErrPolicyMismatch) {
 		t.Fatalf("service retarget accepted: %v", err)
 	}
 	assertNoMutation(t, s)
@@ -93,7 +88,7 @@ func TestB3ServicePolicyEngine(t *testing.T) {
 	s.privileged = true
 	s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 	s.writeResult = observed
-	if err := applyServicePolicy(s, testKey, p); err != nil {
+	if err := applyWith(s, testKey, p); err != nil {
 		t.Fatal(err)
 	}
 	if s.opens != 2 || len(s.writes) != 1 || len(s.deleted) != 0 || len(s.creates) != 0 {
@@ -106,7 +101,7 @@ func TestB3ServicePolicyEngine(t *testing.T) {
 	s.privileged = true
 	s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 	s.writeResult = serviceSIDDescriptor(t, p.SID(), 0x801600A9)
-	err = applyServicePolicy(s, testKey, p)
+	err = applyWith(s, testKey, p)
 	if !errors.Is(err, ErrPostWriteVerification) {
 		t.Fatalf("unsafe migration accepted: %v", err)
 	}
@@ -121,7 +116,7 @@ func TestDescriptorReadFailureStillRollsBackNewKey(t *testing.T) {
 	s := newFakeStore(t)
 	s.privileged = true
 	s.sdErr = errors.New("synthetic descriptor read failure")
-	_, err := loadOrCreateForService(s, testKey, mustServicePolicy(t, testServiceName))
+	_, err := createWith(s, testKey, mustServicePolicy(t, testServiceName))
 	if !errors.Is(err, s.sdErr) || !strings.Contains(err.Error(), "descriptor unavailable") || strings.Contains(err.Error(), "persisted_sd_dacl_hex=") {
 		t.Fatalf("read failure must not fabricate evidence: %v", err)
 	}
@@ -134,7 +129,7 @@ func TestDescriptorReadFailureStillRollsBackNewKey(t *testing.T) {
 func TestDescriptorDiagnosticDoesNotMutateExistingKey(t *testing.T) {
 	p := mustServicePolicy(t, testServiceName)
 	sd := serviceSIDDescriptor(t, p.SID(), 0x80000000) // unobserved service form
-	for _, action := range []string{"open", "load", "apply"} {
+	for _, action := range []string{"open", "apply"} {
 		t.Run(action, func(t *testing.T) {
 			s := newFakeStore(t)
 			s.privileged = true
@@ -142,11 +137,9 @@ func TestDescriptorDiagnosticDoesNotMutateExistingKey(t *testing.T) {
 			var err error
 			switch action {
 			case "open":
-				_, err = openForService(s, testKey, p)
-			case "load":
-				_, err = loadOrCreateForService(s, testKey, p)
+				_, err = openWith(s, testKey, p)
 			case "apply":
-				err = applyServicePolicy(s, testKey, p)
+				err = applyWith(s, testKey, p)
 			}
 			if !errors.Is(err, ErrPolicyMismatch) {
 				t.Fatalf("sentinel lost: %v", err)
@@ -173,7 +166,7 @@ func TestPostWriteDiagnosticNoRollback(t *testing.T) {
 		} else {
 			s.writeResult = bad
 		}
-		err := applyServicePolicy(s, testKey, p)
+		err := applyWith(s, testKey, p)
 		if !errors.Is(err, ErrPostWriteVerification) {
 			t.Fatalf("post-write sentinel lost: %v", err)
 		}
@@ -190,7 +183,7 @@ func TestKSPAdministrativePolicyEngine(t *testing.T) {
 	canonical := buildDescriptor(t, protectedControl, allow(0xD01F01FF, sidSYSTEM), allow(0xD01F01FF, sidAdministrators), allow(0xA0000000, p.SID()))
 	s := newFakeStore(t)
 	s.privileged, s.writeResult = true, canonical
-	signer, err := loadOrCreateForService(s, testKey, p)
+	signer, err := createWith(s, testKey, p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,10 +195,10 @@ func TestKSPAdministrativePolicyEngine(t *testing.T) {
 	s = newFakeStore(t)
 	s.privileged, s.writeResult = true, canonical
 	s.persisted[testKey] = buildDescriptor(t, protectedControl, allow(0xD01F01FF, sidSYSTEM), allow(0xD01F01FF, sidAdministrators), allow(genericRead, sidLocalService))
-	if err := applyServicePolicy(s, testKey, p); err != nil {
+	if err := applyWith(s, testKey, p); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyServicePolicy(s, testKey, p); err != nil {
+	if err := applyWith(s, testKey, p); err != nil {
 		t.Fatal(err)
 	}
 	if len(s.writes) != 1 || len(s.deleted) != 0 || len(s.creates) != 0 {
