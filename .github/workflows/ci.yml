@@ -1,0 +1,96 @@
+name: ci
+
+# Default (synthetic) test suite only. The tests behind the cng_smoke,
+# cng_finalize_probe and cng_native_concurrency build tags create real
+# machine keys and need privileges: CI only compiles them with go vet.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: go version
+        run: go version
+      - name: build
+        run: go build ./...
+      - name: vet (amd64)
+        run: go vet ./...
+      - name: vet (386)
+        run: GOARCH=386 go vet ./...
+      - name: vet native test tags (compile only, not run)
+        run: |
+          go vet -tags cng_smoke ./...
+          go vet -tags cng_finalize_probe ./...
+          go vet -tags cng_native_concurrency ./...
+          go vet -tags "cng_smoke cng_finalize_probe cng_native_concurrency" ./...
+      - name: test (amd64)
+        run: go test ./... -count=1
+      - name: test (386)
+        run: GOARCH=386 go test ./windowscng -count=1
+      - name: detect C compiler for -race
+        id: cc
+        run: |
+          if command -v gcc >/dev/null 2>&1; then
+            gcc --version | head -n 1
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no gcc on the runner: the race test is skipped"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: test (race)
+        if: steps.cc.outputs.found == 'true'
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./windowscng -count=1
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: go version
+        run: go version
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt reports:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./... -count=1
+      - name: unsupported-platform test (verbose)
+        run: go test ./windowscng -count=1 -run '^TestPlatformUnsupported$' -v
