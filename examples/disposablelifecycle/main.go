@@ -7,10 +7,10 @@
 // invocation. It never accepts or deletes an arbitrary production key name and
 // performs no wildcard/prefix deletion.
 //
-// The key is created with LoadOrCreateWithPolicy and PolicyServiceSigner, which
-// requires a privileged caller (SYSTEM or an elevated Administrator); deletion
-// needs a Windows context authorized for it. An elevated PowerShell is one way
-// to run this example:
+// The key is created with Create and PolicyServiceSigner and deleted with
+// Delete against the SubjectPublicKeyInfo recorded right after the create; both
+// require a privileged caller (SYSTEM or an elevated Administrator). An
+// elevated PowerShell is one way to run this example:
 //
 //	go run ./examples/disposablelifecycle
 package main
@@ -19,6 +19,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"time"
@@ -38,9 +39,10 @@ func run() error {
 	name := fmt.Sprintf("Example.CNG.Disposable.%d", time.Now().UnixNano())
 
 	// Creation needs a privileged caller (SYSTEM or an elevated Administrator).
-	signer, err := windowscng.LoadOrCreateWithPolicy(name, windowscng.PolicyServiceSigner)
+	// Create never adopts an existing key: a collision is ErrKeyExists.
+	signer, err := windowscng.Create(name, windowscng.PolicyServiceSigner)
 	if err != nil {
-		return fmt.Errorf("LoadOrCreateWithPolicy: %w", err)
+		return fmt.Errorf("Create: %w", err)
 	}
 	// Immediate cleanup registration. Close is idempotent and releases handles
 	// but does not delete the persisted key; the explicit Close below is the
@@ -50,6 +52,12 @@ func run() error {
 	pub, ok := signer.Public().(*ecdsa.PublicKey)
 	if !ok {
 		return fmt.Errorf("Public() = %T, want *ecdsa.PublicKey", signer.Public())
+	}
+	// Record the identity of the new key before using it: Delete verifies it.
+	// A real consumer stores it durably.
+	spki, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return fmt.Errorf("MarshalPKIXPublicKey: %w", err)
 	}
 
 	digest := sha256.Sum256([]byte("keppin-oss-cng-disposable-lifecycle"))
@@ -67,7 +75,7 @@ func run() error {
 		return fmt.Errorf("close: %w", err)
 	}
 
-	if err := windowscng.Delete(name); err != nil {
+	if err := windowscng.Delete(name, windowscng.PolicyServiceSigner, spki); err != nil {
 		return fmt.Errorf("delete %q: %w", name, err)
 	}
 

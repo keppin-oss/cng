@@ -57,14 +57,15 @@ The `local-service` cells ran from a scheduled task, so their tokens held no
 service SID.
 
 `-probe.sddl` selects the DACL written before finalize: `legacy` is the
-`LoadOrCreate` DACL, `privileged-only` the `PolicyPrivilegedOnly` DACL,
+`PolicyServiceSigner` DACL (the one the `LoadOrCreate` of v0.4.0 and earlier
+requested), `privileged-only` the `PolicyPrivilegedOnly` DACL,
 `service:<Name>` the DACL of `NewServicePolicy(<Name>)`. The service does not
 need to exist. A service SID written in the SDDL is not the same as a token
 that holds it: the token is recorded, including any service SID.
 
-The production policy functions create keys only for privileged callers, so the
-probe calls the internal create path directly (`createPersistedKeyWith`). That
-is the exact path `LoadOrCreate` uses.
+`Create` creates keys only for privileged callers, so the probe calls the
+internal create path directly (`createPersistedKeyWith`). That is the exact
+path `Create` uses.
 
 ## Preparation (elevated PowerShell)
 

@@ -9,19 +9,37 @@ import (
 	"strings"
 )
 
-// Policy selects the access-control policy of a persisted machine-scoped key
-// for the policy-aware functions OpenWithPolicy, LoadOrCreateWithPolicy and
-// ApplyPolicy. The legacy Open, LoadOrCreate and Delete functions are not
-// affected by Policy and keep their existing behavior.
+// KeyPolicy is the access policy of a persisted machine-scoped key, the
+// policy argument of Open, Create, Delete and Apply. Its only valid values are
+// a Policy (PolicyServiceSigner or PolicyPrivilegedOnly) and a ServicePolicy
+// built by NewServicePolicy, passed by value.
+//
+// The unexported method keeps other packages from declaring their own
+// policies, but a type that embeds Policy or ServicePolicy would still satisfy
+// the interface. Every function therefore accepts only the concrete values
+// Policy and ServicePolicy and rejects anything else (nil, a pointer, even a
+// typed nil one, or any other dynamic type) with an input error, before any
+// native call and without panicking. The zero values Policy(0) and
+// ServicePolicy{} are not valid policies.
+type KeyPolicy interface {
+	isKeyPolicy()
+}
+
+func (Policy) isKeyPolicy()        {}
+func (ServicePolicy) isKeyPolicy() {}
+
+// Policy selects one of the two fixed access-control policies of a persisted
+// machine-scoped key. It is a KeyPolicy; ServicePolicy is the other one.
 //
 // The zero value is not a valid policy; callers must choose one explicitly.
 type Policy int
 
 const (
-	// PolicyServiceSigner is the policy provisioned by LoadOrCreate: a
-	// protected DACL granting SYSTEM and Administrators GENERIC_ALL and LOCAL
-	// SERVICE GENERIC_READ|GENERIC_EXECUTE, so that a LOCAL SERVICE runtime can
-	// open the key and sign.
+	// PolicyServiceSigner is a protected DACL granting SYSTEM and
+	// Administrators GENERIC_ALL and LOCAL SERVICE
+	// GENERIC_READ|GENERIC_EXECUTE, so that a LOCAL SERVICE runtime can open
+	// the key and sign. It is the DACL that every release before v0.5.0
+	// requested for the keys created by the removed LoadOrCreate.
 	//
 	//	D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGX;;;LS)
 	PolicyServiceSigner Policy = iota + 1
@@ -48,14 +66,18 @@ func (p Policy) String() string {
 }
 
 // ErrPolicyMismatch indicates that a persisted key's DACL is not exactly in the
-// state required by the requested Policy, or that a requested policy change is
-// not a permitted transition. No pre-existing key was modified: OpenWithPolicy
-// and the Open... functions never write, and ApplyPolicy/ApplyServicePolicy
-// return it only before writing (a failure after the write is
-// ErrPostWriteVerification). The LoadOrCreate... functions also return it
-// when the key they just created does not hold the policy: that key is then
-// deleted, or, if the delete fails, the error also wraps ErrCleanupFailed and
-// the new key may persist.
+// state required by the requested KeyPolicy, that its public key is not a
+// valid ECDSA P-256 key, or that a requested policy change is not a permitted
+// transition. A failure to read the DACL or the export policy is reported as
+// its own error, not as ErrPolicyMismatch.
+//
+// No pre-existing key was modified: Open never writes, Apply returns it only
+// before writing (a failure after the write is ErrPostWriteVerification), and
+// Delete returns it together with ErrDeleteVerificationFailed without
+// deleting anything. Create also returns it when the key it just created does
+// not hold the policy: that key is then deleted through the same handle, or,
+// if the delete fails, the error also wraps ErrCleanupFailed and the new key
+// may persist.
 var ErrPolicyMismatch = errors.New("windowscng: persisted key does not match the requested policy")
 
 // ErrPrivilegeRequired indicates that the operation requires the calling
@@ -64,22 +86,23 @@ var ErrPolicyMismatch = errors.New("windowscng: persisted key does not match the
 // established. No key was opened, created or modified on that basis.
 var ErrPrivilegeRequired = errors.New("windowscng: operation requires a privileged (SYSTEM or elevated Administrators) caller")
 
-// ErrKeyExists indicates that CreateForService found a persisted key with the
-// requested name: NCryptCreatePersistedKey, called without
-// NCRYPT_OVERWRITE_KEY_FLAG, reported NTE_EXISTS. The existing key was not
-// opened, adopted, modified or deleted, and no signer is returned. The native
-// status stays reachable as an *NCryptError with Code NTEExists. Only the
-// status of the create call produces it; LoadOrCreate and the other functions
-// never return it.
+// ErrKeyExists indicates that Create found a persisted key with the requested
+// name: NCryptCreatePersistedKey, called without NCRYPT_OVERWRITE_KEY_FLAG,
+// reported NTE_EXISTS. The existing key was not opened, adopted, modified or
+// deleted, and no signer is returned. The native status stays reachable as an
+// *NCryptError with Code NTEExists. Only the status of that create call
+// produces it, never the same status from a later step, and no other function
+// returns it. It covers only a key already persisted under the name: it does
+// not reserve the name against a concurrent creator.
 var ErrKeyExists = errors.New("windowscng: a persisted CNG key with this name already exists")
 
-// ErrDeleteVerificationFailed indicates that DeleteForService opened the key
-// but did not delete it, because a check on that open handle did not pass or
-// could not be completed: the key is exportable, is not a valid ECDSA P-256
-// key, its DACL is not exactly the requested ServicePolicy form, or its
-// public key differs from the expected SubjectPublicKeyInfo. Nothing was
-// deleted or modified. ErrPolicyMismatch is also wrapped when the cause is a
-// policy mismatch, and native causes stay reachable with errors.As.
+// ErrDeleteVerificationFailed indicates that Delete opened the key but did not
+// delete it, because a check on that open handle did not pass or could not be
+// completed: the key is exportable, is not a valid ECDSA P-256 key, its DACL
+// is not exactly the requested KeyPolicy form, or its public key differs from
+// the expected SubjectPublicKeyInfo. Nothing was deleted or modified.
+// ErrPolicyMismatch is also wrapped when the cause is a policy mismatch, and
+// native causes stay reachable with errors.As.
 var ErrDeleteVerificationFailed = errors.New("windowscng: key verification failed before delete; nothing was deleted")
 
 // validate rejects the zero value and any undefined Policy.

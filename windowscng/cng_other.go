@@ -4,57 +4,28 @@ package windowscng
 
 import "fmt"
 
-// Open is not supported on non-Windows platforms.
-func Open(name string) (Signer, error) {
-	return nil, fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
+// errUnsupportedPlatform is returned by every key function off Windows. Input
+// validation is not performed first: its precedence is a Windows behavior.
+func errUnsupportedPlatform() error {
+	return fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
 }
 
-// LoadOrCreate is not supported on non-Windows platforms.
-func LoadOrCreate(name string) (Signer, error) {
-	return nil, fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
+// Open is not supported on non-Windows platforms.
+func Open(name string, policy KeyPolicy) (Signer, error) {
+	return nil, errUnsupportedPlatform()
+}
+
+// Create is not supported on non-Windows platforms.
+func Create(name string, policy KeyPolicy) (Signer, error) {
+	return nil, errUnsupportedPlatform()
 }
 
 // Delete is not supported on non-Windows platforms.
-func Delete(name string) error {
-	return fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
+func Delete(name string, policy KeyPolicy, expectedSPKI []byte) error {
+	return errUnsupportedPlatform()
 }
 
-// OpenWithPolicy is not supported on non-Windows platforms.
-func OpenWithPolicy(name string, policy Policy) (Signer, error) {
-	return nil, fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
-}
-
-// LoadOrCreateWithPolicy is not supported on non-Windows platforms.
-func LoadOrCreateWithPolicy(name string, policy Policy) (Signer, error) {
-	return nil, fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
-}
-
-// ApplyPolicy is not supported on non-Windows platforms.
-func ApplyPolicy(name string, policy Policy) error {
-	return fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
-}
-
-// OpenForService is not supported on non-Windows platforms.
-func OpenForService(name string, policy ServicePolicy) (Signer, error) {
-	return nil, fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
-}
-
-// LoadOrCreateForService is not supported on non-Windows platforms.
-func LoadOrCreateForService(name string, policy ServicePolicy) (Signer, error) {
-	return nil, fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
-}
-
-// ApplyServicePolicy is not supported on non-Windows platforms.
-func ApplyServicePolicy(name string, policy ServicePolicy) error {
-	return fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
-}
-
-// CreateForService is not supported on non-Windows platforms.
-func CreateForService(name string, policy ServicePolicy) (Signer, error) {
-	return nil, fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
-}
-
-// DeleteForService is not supported on non-Windows platforms.
-func DeleteForService(name string, policy ServicePolicy, expectedSPKI []byte) error {
-	return fmt.Errorf("windowscng: machine-scoped CNG keys are not supported on this platform")
+// Apply is not supported on non-Windows platforms.
+func Apply(name string, policy KeyPolicy) error {
+	return errUnsupportedPlatform()
 }

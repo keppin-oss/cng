@@ -27,9 +27,9 @@ const (
 )
 
 // errCreateCollision marks, inside the package only, that
-// NCryptCreatePersistedKey itself reported NTE_EXISTS. It is unexported so that
-// the errors of LoadOrCreate and the other existing functions keep exactly the
-// sentinels they had; CreateForService turns it into ErrKeyExists.
+// NCryptCreatePersistedKey itself reported NTE_EXISTS, so that Create can tell
+// that status from the same status in any later step; Create turns it into
+// ErrKeyExists.
 var errCreateCollision = errors.New("windowscng: create reported NTE_EXISTS")
 
 // NCryptError is a failed NCrypt call: the 32-bit SECURITY_STATUS in Code and
@@ -87,9 +87,8 @@ var ErrKeyNotFound = errors.New("windowscng: persisted CNG key not found or not 
 // whole call (runtime.LockOSThread), as for any impersonated NCrypt call.
 var ErrCleanupFailed = errors.New("windowscng: deleting the key created by the failed call also failed; the key may persist")
 
-// ErrPostWriteVerification indicates that ApplyPolicy or ApplyServicePolicy
-// wrote the new DACL but could not then confirm it: a read-back on the same
-// handle, the reopen of the key or a read-back on the fresh handle failed or
+// ErrPostWriteVerification indicates that Apply wrote the new DACL but could
+// not then confirm it: a read-back on the same handle, the reopen of the key or a read-back on the fresh handle failed or
 // did not match. Only the native causes (NCryptError, syscall.Errno) are
 // reachable through the error tree: no other sentinel of this package matches,
 // so a read-back mismatch is not ErrPolicyMismatch and a reopen reporting the

@@ -8,95 +8,9 @@ import (
 	"testing"
 )
 
-// These tests exercise the verifiers of a persisted key on in-memory data and
-// injected NCryptGetProperty results. They never call an NCrypt function and
-// never open, create, modify or delete a CNG key; verifyDescriptorDACL itself
-// uses only in-memory Win32 calls.
-
-func TestVerifyDescriptorDACLAccepts(t *testing.T) {
-	if err := loadNativeAPIs(); err != nil {
-		t.Fatal(err)
-	}
-	tests := []struct {
-		name string
-		sd   []byte
-	}{
-		{"SYSTEM GA, Administrators GA, LOCAL SERVICE GR|GX", buildDescriptor(t, protectedControl,
-			allow(genericAll, sidSYSTEM), allow(genericAll, sidAdministrators), allow(genericRead|genericExecute, sidLocalService))},
-		{"KSP form", buildDescriptor(t, protectedControl,
-			allow(0xD01F01FF, sidSYSTEM), allow(0xD01F01FF, sidAdministrators), allow(0x801200A9, sidLocalService))},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := verifyDescriptorDACL(tt.sd); err != nil {
-				t.Fatalf("verifyDescriptorDACL: %v", err)
-			}
-		})
-	}
-}
-
-func TestVerifyDescriptorDACLRejects(t *testing.T) {
-	if err := loadNativeAPIs(); err != nil {
-		t.Fatal(err)
-	}
-	sy := allow(genericAll, sidSYSTEM)
-	ba := allow(genericAll, sidAdministrators)
-	ls := allow(genericRead|genericExecute, sidLocalService)
-	withExtra := func(sid string) []byte {
-		return buildDescriptor(t, protectedControl, sy, ba, ls, allow(genericRead, sid))
-	}
-	setU32 := func(b []byte, off int, v uint32) []byte { binary.LittleEndian.PutUint32(b[off:], v); return b }
-
-	tests := []struct {
-		name string
-		sd   []byte
-		want string
-	}{
-		{"Everyone", withExtra(sidEveryone), "persisted DACL contains forbidden allow ACE for Everyone"},
-		{"Authenticated Users", withExtra(sidAuthUsers), "persisted DACL contains forbidden allow ACE for Authenticated Users"},
-		{"Built-in Users", withExtra(sidBuiltinUsers), "persisted DACL contains forbidden allow ACE for Built-in Users"},
-		{"Interactive", withExtra(sidInteractive), "persisted DACL contains forbidden allow ACE for Interactive Users"},
-		{"Service", withExtra(sidService), "persisted DACL contains forbidden allow ACE for Service"},
-		{"Anonymous", withExtra(sidAnonymous), "persisted DACL contains forbidden allow ACE for Anonymous"},
-
-		{"SYSTEM missing", buildDescriptor(t, protectedControl, ba, ls), "persisted DACL missing expected allow ACE for SYSTEM"},
-		{"Administrators missing", buildDescriptor(t, protectedControl, sy, ls), "persisted DACL missing expected allow ACE for Administrators"},
-		{"LOCAL SERVICE missing", buildDescriptor(t, protectedControl, sy, ba), "persisted DACL missing expected allow ACE for LOCAL SERVICE"},
-
-		{"SYSTEM duplicate", buildDescriptor(t, protectedControl, sy, sy, ba, ls), "duplicate allow ACE for SYSTEM"},
-		{"Administrators duplicate", buildDescriptor(t, protectedControl, sy, ba, ba, ls), "duplicate allow ACE for Administrators"},
-		{"LOCAL SERVICE duplicate", buildDescriptor(t, protectedControl, sy, ba, ls, ls), "duplicate allow ACE for LOCAL SERVICE"},
-
-		{"SYSTEM without GA", buildDescriptor(t, protectedControl, allow(genericRead, sidSYSTEM), ba, ls),
-			"SYSTEM ACE generic mask 0x80000000 lacks GENERIC_ALL bit (0x10000000)"},
-		{"Administrators without GA", buildDescriptor(t, protectedControl, sy, allow(genericRead, sidAdministrators), ls),
-			"Administrators ACE generic mask 0x80000000 lacks GENERIC_ALL bit (0x10000000)"},
-		{"LOCAL SERVICE without GR", buildDescriptor(t, protectedControl, sy, ba, allow(genericExecute, sidLocalService)),
-			"LOCAL SERVICE ACE generic mask 0x20000000 lacks GENERIC_READ"},
-		{"LOCAL SERVICE with GW", buildDescriptor(t, protectedControl, sy, ba, allow(genericRead|genericWrite, sidLocalService)),
-			"LOCAL SERVICE ACE generic mask 0xC0000000 grants administrative/write access"},
-		{"LOCAL SERVICE with GA", buildDescriptor(t, protectedControl, sy, ba, allow(genericRead|genericAll, sidLocalService)),
-			"LOCAL SERVICE ACE generic mask 0x90000000 grants administrative/write access"},
-
-		{"DACL absent", buildDescriptor(t, seSelfRelative|seDACLProtected, sy, ba, ls),
-			"persisted DACL is NULL — key has no access control"},
-		{"DACL NULL", setU32(buildDescriptor(t, protectedControl, sy, ba, ls), 16, 0),
-			"persisted DACL is NULL — key has no access control"},
-		{"zero ACEs", buildDescriptor(t, protectedControl),
-			"persisted DACL has zero ACEs — key is inaccessible"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := verifyDescriptorDACL(tt.sd)
-			if err == nil {
-				t.Fatal("verifyDescriptorDACL accepted the descriptor")
-			}
-			if err.Error() != tt.want {
-				t.Fatalf("error = %q, want %q", err, tt.want)
-			}
-		})
-	}
-}
+// These tests exercise the verifiers of a persisted key on injected
+// NCryptGetProperty results. They never call an NCrypt function and never
+// open, create, modify or delete a CNG key.
 
 // getPropertyFake is an ncryptGetPropertyFunc that answers from a script and
 // fails the test if the key, the property or the flags are not those the
@@ -258,18 +172,4 @@ func TestGetSecurityDescriptorWith(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
-}
-
-// TestVerifyDescriptorDACLEmptyIsAnError: an empty descriptor must not reach
-// the first element of the buffer.
-func TestVerifyDescriptorDACLEmptyIsAnError(t *testing.T) {
-	if err := loadNativeAPIs(); err != nil {
-		t.Fatal(err)
-	}
-	for _, sd := range [][]byte{nil, {}} {
-		err := verifyDescriptorDACL(sd)
-		if err == nil || err.Error() != "persisted security descriptor is empty" {
-			t.Errorf("verifyDescriptorDACL(%#v) = %v", sd, err)
-		}
-	}
 }

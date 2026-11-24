@@ -44,15 +44,15 @@ type fakeStore struct {
 	// pub, if set, is the public key the fake reports; otherwise a zero key.
 	pub *ecdsa.PublicKey
 	// allowDeleteExisting lets deleteAndRelease run on a key the fake did not
-	// create, as DeleteForService does after verification.
+	// create, as Delete does after verification.
 	allowDeleteExisting bool
 	// pubReads counts publicKey calls on every handle.
 	pubReads int
 	setErr   error
 	sdErr    error
 	// sdErrAt, if set, makes only the descriptor read with that 1-based
-	// number (counted by sdReads, across all handles) fail. In ApplyPolicy
-	// and ApplyServicePolicy read 1 is before the write, read 2 the read-back
+	// number (counted by sdReads, across all handles) fail. In Apply
+	// and Apply read 1 is before the write, read 2 the read-back
 	// on the open handle and read 3 the read-back on the fresh handle.
 	sdErrAt   map[int]error
 	deleteErr error // failure of deleteAndRelease; the key then persists
@@ -72,10 +72,27 @@ type fakeStore struct {
 	writes          []string // SDDLs passed to setSecurityDescriptor
 	deleted         []string
 	openHandles     int // currently open handles
+
+	// bindings gives each key object an identity distinct from its name: it
+	// counts the objects bound to a name, by create or by rebind. A handle
+	// keeps the binding it was opened or created on, and deleting it removes
+	// the name only while that binding is still current, as NCryptDeleteKey
+	// acts on the object behind the handle, not on the name.
+	bindings map[string]int
+	// afterCreate, if set, runs once the create has persisted the new key
+	// (for example to simulate another writer replacing it under the name).
+	afterCreate func()
+}
+
+// rebind binds a new key object with descriptor sd to name, replacing the
+// object currently visible under it, as a concurrent creator would.
+func (s *fakeStore) rebind(name string, sd []byte) {
+	s.bindings[name]++
+	s.persisted[name] = sd
 }
 
 func newFakeStore(t *testing.T) *fakeStore {
-	return &fakeStore{t: t, persisted: map[string][]byte{}}
+	return &fakeStore{t: t, persisted: map[string][]byte{}, bindings: map[string]int{}}
 }
 
 func (s *fakeStore) callerPrivileged() (bool, error) {
@@ -99,7 +116,7 @@ func (s *fakeStore) open(name string) (storedKey, error) {
 		sd = s.reopenResult
 	}
 	s.openHandles++
-	return &fakeKey{store: s, name: name, sd: sd}, nil
+	return &fakeKey{store: s, name: name, sd: sd, binding: s.bindings[name]}, nil
 }
 
 func (s *fakeStore) create(name, sddl string) (storedKey, error) {
@@ -114,9 +131,14 @@ func (s *fakeStore) create(name, sddl string) (storedKey, error) {
 	if s.writeResult != nil {
 		sd = s.writeResult
 	}
+	s.bindings[name]++
 	s.persisted[name] = sd
 	s.openHandles++
-	return &fakeKey{store: s, name: name, sd: sd, created: true}, nil
+	k := &fakeKey{store: s, name: name, sd: sd, created: true, binding: s.bindings[name]}
+	if s.afterCreate != nil {
+		s.afterCreate()
+	}
+	return k, nil
 }
 
 func (s *fakeStore) descriptorFor(sddl string) []byte {
@@ -139,6 +161,7 @@ type fakeKey struct {
 	sd      []byte
 	created bool
 	done    bool
+	binding int // the object identity, see fakeStore.bindings
 }
 
 func (k *fakeKey) verifyNonExportable() error { return k.store.exportErr }
@@ -204,7 +227,9 @@ func (k *fakeKey) deleteAndRelease() error {
 	if k.store.deleteErr != nil {
 		return k.store.deleteErr
 	}
-	delete(k.store.persisted, k.name)
+	if k.store.bindings[k.name] == k.binding {
+		delete(k.store.persisted, k.name)
+	}
 	return nil
 }
 
@@ -242,13 +267,13 @@ func TestPolicyAPIsRejectInvalidPolicy(t *testing.T) {
 	for _, p := range []Policy{0, 3} {
 		s := newFakeStore(t)
 		s.privileged = true
-		if _, err := openWithPolicy(s, testKey, p); err == nil {
+		if _, err := openWith(s, testKey, p); err == nil {
 			t.Errorf("openWithPolicy accepted %v", p)
 		}
-		if _, err := loadOrCreateWithPolicy(s, testKey, p); err == nil {
-			t.Errorf("loadOrCreateWithPolicy accepted %v", p)
+		if _, err := createWith(s, testKey, p); err == nil {
+			t.Errorf("createWith accepted %v", p)
 		}
-		if err := applyPolicy(s, testKey, p); err == nil {
+		if err := applyWith(s, testKey, p); err == nil {
 			t.Errorf("applyPolicy accepted %v", p)
 		}
 		if s.opens != 0 || s.privilegeChecks != 0 {
@@ -258,11 +283,11 @@ func TestPolicyAPIsRejectInvalidPolicy(t *testing.T) {
 	}
 }
 
-func TestOpenWithPolicy(t *testing.T) {
+func TestOpenPolicy(t *testing.T) {
 	t.Run("privileged-only rejects non-privileged caller before open", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.persisted[testKey] = privilegedOnlyDescriptor(t)
-		_, err := openWithPolicy(s, testKey, PolicyPrivilegedOnly)
+		_, err := openWith(s, testKey, PolicyPrivilegedOnly)
 		if !errors.Is(err, ErrPrivilegeRequired) {
 			t.Fatalf("err = %v, want ErrPrivilegeRequired", err)
 		}
@@ -274,7 +299,7 @@ func TestOpenWithPolicy(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
 		s.privErr = errors.New("CheckTokenMembership failed")
-		_, err := openWithPolicy(s, testKey, PolicyPrivilegedOnly)
+		_, err := openWith(s, testKey, PolicyPrivilegedOnly)
 		if !errors.Is(err, ErrPrivilegeRequired) || s.opens != 0 {
 			t.Fatalf("err = %v opens=%d, want ErrPrivilegeRequired and no open", err, s.opens)
 		}
@@ -283,7 +308,7 @@ func TestOpenWithPolicy(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
 		s.persisted[testKey] = privilegedOnlyDescriptor(t)
-		signer, err := openWithPolicy(s, testKey, PolicyPrivilegedOnly)
+		signer, err := openWith(s, testKey, PolicyPrivilegedOnly)
 		if err != nil || signer == nil {
 			t.Fatalf("openWithPolicy: %v", err)
 		}
@@ -293,7 +318,7 @@ func TestOpenWithPolicy(t *testing.T) {
 	t.Run("service-signer does not require privilege", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
-		if _, err := openWithPolicy(s, testKey, PolicyServiceSigner); err != nil {
+		if _, err := openWith(s, testKey, PolicyServiceSigner); err != nil {
 			t.Fatalf("openWithPolicy: %v", err)
 		}
 		if s.privilegeChecks != 0 {
@@ -315,7 +340,7 @@ func TestOpenWithPolicy(t *testing.T) {
 			s := newFakeStore(t)
 			s.privileged = true
 			s.persisted[testKey] = tc.sd(t)
-			_, err := openWithPolicy(s, testKey, tc.policy)
+			_, err := openWith(s, testKey, tc.policy)
 			if !errors.Is(err, ErrPolicyMismatch) {
 				t.Fatalf("err = %v, want ErrPolicyMismatch", err)
 			}
@@ -326,7 +351,7 @@ func TestOpenWithPolicy(t *testing.T) {
 	t.Run("not found passes through", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
-		_, err := openWithPolicy(s, testKey, PolicyPrivilegedOnly)
+		_, err := openWith(s, testKey, PolicyPrivilegedOnly)
 		if !errors.Is(err, ErrKeyNotFound) {
 			t.Fatalf("err = %v, want ErrKeyNotFound", err)
 		}
@@ -336,7 +361,7 @@ func TestOpenWithPolicy(t *testing.T) {
 		s := newFakeStore(t)
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.exportErr = errors.New("export policy permits export")
-		if _, err := openWithPolicy(s, testKey, PolicyServiceSigner); err == nil {
+		if _, err := openWith(s, testKey, PolicyServiceSigner); err == nil {
 			t.Fatal("exportable key accepted")
 		}
 		assertHandlesReleased(t, s)
@@ -345,95 +370,68 @@ func TestOpenWithPolicy(t *testing.T) {
 		s := newFakeStore(t)
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.pubErr = errors.New("not P-256")
-		if _, err := openWithPolicy(s, testKey, PolicyServiceSigner); !errors.Is(err, ErrPolicyMismatch) {
+		if _, err := openWith(s, testKey, PolicyServiceSigner); !errors.Is(err, ErrPolicyMismatch) {
 			t.Fatalf("err = %v, want ErrPolicyMismatch", err)
 		}
 		assertHandlesReleased(t, s)
 	})
 }
 
-func TestLoadOrCreateWithPolicy(t *testing.T) {
-	t.Run("privileged-only requires privilege before open", func(t *testing.T) {
-		s := newFakeStore(t)
-		_, err := loadOrCreateWithPolicy(s, testKey, PolicyPrivilegedOnly)
-		if !errors.Is(err, ErrPrivilegeRequired) || s.opens != 0 {
-			t.Fatalf("err = %v opens=%d, want ErrPrivilegeRequired and no open", err, s.opens)
-		}
-		assertNoMutation(t, s)
-	})
-	t.Run("existing matching key is opened, not recreated", func(t *testing.T) {
-		s := newFakeStore(t)
-		s.privileged = true
-		s.persisted[testKey] = privilegedOnlyDescriptor(t)
-		if _, err := loadOrCreateWithPolicy(s, testKey, PolicyPrivilegedOnly); err != nil {
-			t.Fatal(err)
-		}
-		assertNoMutation(t, s)
-		assertHandlesReleased(t, s)
-	})
-	t.Run("existing mismatching key is not converted", func(t *testing.T) {
-		s := newFakeStore(t)
-		s.privileged = true
-		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
-		_, err := loadOrCreateWithPolicy(s, testKey, PolicyPrivilegedOnly)
-		if !errors.Is(err, ErrPolicyMismatch) {
-			t.Fatalf("err = %v, want ErrPolicyMismatch", err)
-		}
-		assertNoMutation(t, s)
-		assertHandlesReleased(t, s)
-	})
-	t.Run("access denied is not treated as missing", func(t *testing.T) {
-		s := newFakeStore(t)
-		s.privileged = true
-		s.openErr = errors.New("NCryptOpenKey: hr=0x80070005")
-		_, err := loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
-		if err == nil || errors.Is(err, ErrKeyNotFound) {
-			t.Fatalf("err = %v, want the open error", err)
-		}
-		assertNoMutation(t, s)
-	})
-	t.Run("not found for non-privileged caller does not create", func(t *testing.T) {
-		s := newFakeStore(t)
-		_, err := loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
-		if !errors.Is(err, ErrPrivilegeRequired) {
-			t.Fatalf("err = %v, want ErrPrivilegeRequired", err)
-		}
-		if errors.Is(err, ErrKeyNotFound) {
-			t.Fatal("ambiguous not-found must not be reported as ErrKeyNotFound to a non-privileged caller")
-		}
-		assertNoMutation(t, s)
-	})
-	t.Run("privilege check error does not create", func(t *testing.T) {
-		s := newFakeStore(t)
-		s.privileged = true
-		s.privErr = errors.New("CheckTokenMembership failed")
-		if _, err := loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner); !errors.Is(err, ErrPrivilegeRequired) {
-			t.Fatalf("err = %v, want ErrPrivilegeRequired", err)
-		}
-		assertNoMutation(t, s)
-	})
+func TestCreateWithPolicy(t *testing.T) {
 	for _, p := range []Policy{PolicyServiceSigner, PolicyPrivilegedOnly} {
-		t.Run("creates with "+p.String()+" SDDL", func(t *testing.T) {
+		t.Run(p.String()+" requires privilege before any create", func(t *testing.T) {
+			s := newFakeStore(t)
+			_, err := createWith(s, testKey, p)
+			if !errors.Is(err, ErrPrivilegeRequired) || s.opens != 0 {
+				t.Fatalf("err = %v opens=%d, want ErrPrivilegeRequired and no open", err, s.opens)
+			}
+			assertNoMutation(t, s)
+		})
+		t.Run("creates with "+p.String()+" SDDL without opening", func(t *testing.T) {
 			s := newFakeStore(t)
 			s.privileged = true
-			if _, err := loadOrCreateWithPolicy(s, testKey, p); err != nil {
-				t.Fatal(err)
+			signer, err := createWith(s, testKey, p)
+			if err != nil || signer == nil {
+				t.Fatalf("createWith: %v", err)
 			}
 			if len(s.creates) != 1 || s.creates[0] != policySDDL(p) {
 				t.Fatalf("creates = %v, want [%s]", s.creates, policySDDL(p))
 			}
-			if len(s.writes) != 0 || len(s.deleted) != 0 {
-				t.Fatalf("unexpected writes=%v deleted=%v", s.writes, s.deleted)
+			if s.opens != 0 || len(s.writes) != 0 || len(s.deleted) != 0 {
+				t.Fatalf("unexpected opens=%d writes=%v deleted=%v", s.opens, s.writes, s.deleted)
 			}
 			assertHandlesReleased(t, s)
 		})
 	}
+	t.Run("privilege check error does not create", func(t *testing.T) {
+		s := newFakeStore(t)
+		s.privileged = true
+		s.privErr = errors.New("CheckTokenMembership failed")
+		if _, err := createWith(s, testKey, PolicyServiceSigner); !errors.Is(err, ErrPrivilegeRequired) {
+			t.Fatalf("err = %v, want ErrPrivilegeRequired", err)
+		}
+		assertNoMutation(t, s)
+	})
+	t.Run("existing key: ErrKeyExists, key untouched", func(t *testing.T) {
+		s := newFakeStore(t)
+		s.privileged = true
+		existing := privilegedOnlyDescriptor(t)
+		s.persisted[testKey] = existing
+		_, err := createWith(s, testKey, PolicyPrivilegedOnly)
+		if !errors.Is(err, ErrKeyExists) {
+			t.Fatalf("err = %v, want ErrKeyExists", err)
+		}
+		if s.opens != 0 || len(s.deleted) != 0 || len(s.writes) != 0 || string(s.persisted[testKey]) != string(existing) {
+			t.Fatal("the existing key must not be opened, modified or deleted")
+		}
+		assertHandlesReleased(t, s)
+	})
 	t.Run("created key failing verification is deleted", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
 		// Simulate provider canonicalization of GA for Administrators.
 		s.writeResult = buildDescriptor(t, protectedControl, allow(genericAll, sidSYSTEM), allow(0x001F0003, sidAdministrators))
-		_, err := loadOrCreateWithPolicy(s, testKey, PolicyPrivilegedOnly)
+		_, err := createWith(s, testKey, PolicyPrivilegedOnly)
 		if !errors.Is(err, ErrPolicyMismatch) {
 			t.Fatalf("err = %v, want ErrPolicyMismatch", err)
 		}
@@ -448,9 +446,9 @@ func TestLoadOrCreateWithPolicy(t *testing.T) {
 	t.Run("create failure does not delete anything", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
-		s.createErr = errors.New("NTE_EXISTS")
-		if _, err := loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner); err == nil {
-			t.Fatal("create failure not reported")
+		s.createErr = errors.New("NCryptCreatePersistedKey: hr=0x80090009")
+		if _, err := createWith(s, testKey, PolicyServiceSigner); err == nil || errors.Is(err, ErrKeyExists) {
+			t.Fatalf("err = %v, want the create failure without ErrKeyExists", err)
 		}
 		if len(s.deleted) != 0 {
 			t.Fatal("create failure must not delete")
@@ -458,19 +456,19 @@ func TestLoadOrCreateWithPolicy(t *testing.T) {
 	})
 }
 
-// TestLoadOrCreateSpecSignerFailureR2 covers R2 on the policy/service path:
-// checkKeyPolicy (first public-key export) succeeds and signer() (second
-// export) fails. Only a key created by the call is rolled back.
-func TestLoadOrCreateSpecSignerFailureR2(t *testing.T) {
+// TestCreateSignerFailureR2 covers R2 for Create: checkKeyPolicy (first
+// public-key export) succeeds and signer() (second export) fails. Only the
+// key created by the call is rolled back, through its own handle.
+func TestCreateSignerFailureR2(t *testing.T) {
 	requireNCryptNotLoaded(t)
 	signerErr := errors.New("export public key for " + testKey + ": NCryptExportKey: hr=0x80090009")
 	deleteErr := errors.New("NCryptDeleteKey: hr=0x80090010")
 	servicePolicy := mustServicePolicy(t, testServiceName)
 	run := func(s *fakeStore, service bool) (Signer, error) {
 		if service {
-			return loadOrCreateForService(s, testKey, servicePolicy)
+			return createWith(s, testKey, servicePolicy)
 		}
-		return loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
+		return createWith(s, testKey, PolicyServiceSigner)
 	}
 	for _, service := range []bool{false, true} {
 		label := "with-policy"
@@ -520,26 +518,11 @@ func TestLoadOrCreateSpecSignerFailureR2(t *testing.T) {
 			assertHandlesReleased(t, s)
 		})
 	}
-	t.Run("existing key, signer fails: no delete", func(t *testing.T) {
-		s := newFakeStore(t)
-		s.privileged = true
-		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead|genericExecute)
-		s.signerErr = signerErr
-		_, err := loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
-		if !errors.Is(err, signerErr) || errors.Is(err, ErrCleanupFailed) || strings.Contains(err.Error(), "was deleted") {
-			t.Fatalf("err = %v, want only the export cause", err)
-		}
-		assertNoMutation(t, s)
-		if _, ok := s.persisted[testKey]; !ok {
-			t.Fatal("pre-existing key removed")
-		}
-		assertHandlesReleased(t, s)
-	})
-	t.Run("OpenWithPolicy, signer fails: no create or delete", func(t *testing.T) {
+	t.Run("Open, existing key, signer fails: no create or delete", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead|genericExecute)
 		s.signerErr = signerErr
-		if _, err := openWithPolicy(s, testKey, PolicyServiceSigner); !errors.Is(err, signerErr) {
+		if _, err := openWith(s, testKey, PolicyServiceSigner); !errors.Is(err, signerErr) {
 			t.Fatalf("err = %v, want the export cause", err)
 		}
 		assertNoMutation(t, s)
@@ -549,22 +532,22 @@ func TestLoadOrCreateSpecSignerFailureR2(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
 		s.signerErr = signerErr
-		if _, err := loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner); err == nil {
+		if _, err := createWith(s, testKey, PolicyServiceSigner); err == nil {
 			t.Fatal("want error")
 		}
 		if len(s.deletedKeys) != 1 || !s.deletedKeys[0].created {
 			t.Fatalf("deletedKeys = %v, want exactly the key object returned by create", s.deletedKeys)
 		}
-		if s.opens != 1 {
-			t.Fatalf("opens = %d, want 1: rollback must not reopen the key by name", s.opens)
+		if s.opens != 0 {
+			t.Fatalf("opens = %d, want 0: rollback must not reopen the key by name", s.opens)
 		}
 	})
 	t.Run("success transfers ownership, no rollback", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
-		signer, err := loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
+		signer, err := createWith(s, testKey, PolicyServiceSigner)
 		if err != nil || signer == nil {
-			t.Fatalf("loadOrCreateWithPolicy: %v", err)
+			t.Fatalf("createWith: %v", err)
 		}
 		if len(s.deleted) != 0 || s.signerCalls != 1 {
 			t.Fatalf("deleted=%v signerCalls=%d", s.deleted, s.signerCalls)
@@ -573,12 +556,12 @@ func TestLoadOrCreateSpecSignerFailureR2(t *testing.T) {
 	})
 }
 
-func TestApplyPolicy(t *testing.T) {
+func TestApplyPolicyValues(t *testing.T) {
 	t.Run("requires privilege before open", func(t *testing.T) {
 		for _, p := range []Policy{PolicyServiceSigner, PolicyPrivilegedOnly} {
 			s := newFakeStore(t)
 			s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
-			if err := applyPolicy(s, testKey, p); !errors.Is(err, ErrPrivilegeRequired) {
+			if err := applyWith(s, testKey, p); !errors.Is(err, ErrPrivilegeRequired) {
 				t.Fatalf("%s: err = %v, want ErrPrivilegeRequired", p, err)
 			}
 			if s.opens != 0 {
@@ -590,7 +573,7 @@ func TestApplyPolicy(t *testing.T) {
 	t.Run("missing key is never created", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
-		if err := applyPolicy(s, testKey, PolicyPrivilegedOnly); !errors.Is(err, ErrKeyNotFound) {
+		if err := applyWith(s, testKey, PolicyPrivilegedOnly); !errors.Is(err, ErrKeyNotFound) {
 			t.Fatalf("err = %v, want ErrKeyNotFound", err)
 		}
 		assertNoMutation(t, s)
@@ -600,14 +583,14 @@ func TestApplyPolicy(t *testing.T) {
 			s := newFakeStore(t)
 			s.privileged = true
 			s.persisted[testKey] = serviceSignerDescriptor(t, lsMask)
-			if err := applyPolicy(s, testKey, PolicyPrivilegedOnly); err != nil {
+			if err := applyWith(s, testKey, PolicyPrivilegedOnly); err != nil {
 				t.Fatal(err)
 			}
 			if len(s.writes) != 1 || s.writes[0] != privilegedOnlySDDL {
 				t.Fatalf("writes = %v, want exactly one privileged-only write", s.writes)
 			}
 			if len(s.creates) != 0 || len(s.deleted) != 0 {
-				t.Fatal("ApplyPolicy must not create or delete")
+				t.Fatal("Apply must not create or delete")
 			}
 			if st, _ := classifyDescriptor(s.persisted[testKey]); st != daclPrivilegedOnly {
 				t.Fatalf("persisted state = %s", st)
@@ -629,7 +612,7 @@ func TestApplyPolicy(t *testing.T) {
 			s := newFakeStore(t)
 			s.privileged = true
 			s.persisted[testKey] = tc.sd(t)
-			if err := applyPolicy(s, testKey, tc.p); err != nil {
+			if err := applyWith(s, testKey, tc.p); err != nil {
 				t.Fatalf("%s: %v", tc.p, err)
 			}
 			assertNoMutation(t, s)
@@ -640,7 +623,7 @@ func TestApplyPolicy(t *testing.T) {
 		s := newFakeStore(t)
 		s.privileged = true
 		s.persisted[testKey] = privilegedOnlyDescriptor(t)
-		if err := applyPolicy(s, testKey, PolicyServiceSigner); !errors.Is(err, ErrPolicyMismatch) {
+		if err := applyWith(s, testKey, PolicyServiceSigner); !errors.Is(err, ErrPolicyMismatch) {
 			t.Fatalf("err = %v, want ErrPolicyMismatch", err)
 		}
 		assertNoMutation(t, s)
@@ -663,7 +646,7 @@ func TestApplyPolicy(t *testing.T) {
 			s := newFakeStore(t)
 			s.privileged = true
 			s.persisted[testKey] = tc.sd(t)
-			if err := applyPolicy(s, testKey, PolicyPrivilegedOnly); !errors.Is(err, ErrPolicyMismatch) {
+			if err := applyWith(s, testKey, PolicyPrivilegedOnly); !errors.Is(err, ErrPolicyMismatch) {
 				t.Fatalf("err = %v, want ErrPolicyMismatch", err)
 			}
 			assertNoMutation(t, s)
@@ -675,7 +658,7 @@ func TestApplyPolicy(t *testing.T) {
 		s.privileged = true
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.exportErr = errors.New("export policy permits export")
-		if err := applyPolicy(s, testKey, PolicyPrivilegedOnly); err == nil {
+		if err := applyWith(s, testKey, PolicyPrivilegedOnly); err == nil {
 			t.Fatal("exportable key accepted")
 		}
 		assertNoMutation(t, s)
@@ -685,7 +668,7 @@ func TestApplyPolicy(t *testing.T) {
 		s.privileged = true
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.pubErr = errors.New("not P-256")
-		if err := applyPolicy(s, testKey, PolicyPrivilegedOnly); !errors.Is(err, ErrPolicyMismatch) {
+		if err := applyWith(s, testKey, PolicyPrivilegedOnly); !errors.Is(err, ErrPolicyMismatch) {
 			t.Fatalf("err = %v, want ErrPolicyMismatch", err)
 		}
 		assertNoMutation(t, s)
@@ -695,7 +678,7 @@ func TestApplyPolicy(t *testing.T) {
 		s.privileged = true
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.setErr = errors.New("set security descriptor: hr=0x80090010")
-		if err := applyPolicy(s, testKey, PolicyPrivilegedOnly); err == nil {
+		if err := applyWith(s, testKey, PolicyPrivilegedOnly); err == nil {
 			t.Fatal("write failure not reported")
 		}
 		assertHandlesReleased(t, s)
@@ -705,7 +688,7 @@ func TestApplyPolicy(t *testing.T) {
 		s.privileged = true
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.writeResult = buildDescriptor(t, protectedControl, allow(genericAll, sidSYSTEM), allow(0x001F0003, sidAdministrators))
-		err := applyPolicy(s, testKey, PolicyPrivilegedOnly)
+		err := applyWith(s, testKey, PolicyPrivilegedOnly)
 		if !errors.Is(err, ErrPostWriteVerification) {
 			t.Fatalf("err = %v, want ErrPostWriteVerification", err)
 		}
@@ -719,7 +702,7 @@ func TestApplyPolicy(t *testing.T) {
 		s.privileged = true
 		s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 		s.reopenResult = serviceSignerDescriptor(t, genericRead)
-		err := applyPolicy(s, testKey, PolicyPrivilegedOnly)
+		err := applyWith(s, testKey, PolicyPrivilegedOnly)
 		if !errors.Is(err, ErrPostWriteVerification) {
 			t.Fatalf("err = %v, want ErrPostWriteVerification", err)
 		}
@@ -796,11 +779,11 @@ func TestPolicyZeroSizeExportComposition(t *testing.T) {
 	zeroErr := zeroSizeExportError(t)
 	signerZeroErr := fmt.Errorf("export public key for %s: %w", testKey, zeroErr)
 	servicePolicy := mustServicePolicy(t, testServiceName)
-	loadOrCreate := func(s *fakeStore, service bool) (Signer, error) {
+	create := func(s *fakeStore, service bool) (Signer, error) {
 		if service {
-			return loadOrCreateForService(s, testKey, servicePolicy)
+			return createWith(s, testKey, servicePolicy)
 		}
-		return loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
+		return createWith(s, testKey, PolicyServiceSigner)
 	}
 	for _, service := range []bool{false, true} {
 		label := "with-policy"
@@ -819,7 +802,7 @@ func TestPolicyZeroSizeExportComposition(t *testing.T) {
 				if deleteFails {
 					s.deleteErr = errors.New("NCryptDeleteKey: hr=0x80090010")
 				}
-				_, err := loadOrCreate(s, service)
+				_, err := create(s, service)
 				if !errors.Is(err, ErrPolicyMismatch) || !errors.Is(err, zeroErr) {
 					t.Fatalf("err = %v, want ErrPolicyMismatch and the zero-size cause (C2)", err)
 				}
@@ -838,7 +821,7 @@ func TestPolicyZeroSizeExportComposition(t *testing.T) {
 				if deleteFails {
 					s.deleteErr = errors.New("NCryptDeleteKey: hr=0x80090010")
 				}
-				_, err := loadOrCreate(s, service)
+				_, err := create(s, service)
 				if !errors.Is(err, zeroErr) || errors.Is(err, ErrPolicyMismatch) {
 					t.Fatalf("err = %v, want the zero-size cause from the signer", err)
 				}
@@ -856,55 +839,45 @@ func TestPolicyZeroSizeExportComposition(t *testing.T) {
 		}
 	}
 	t.Run("existing key, zero at first export: no delete", func(t *testing.T) {
-		for _, open := range []bool{false, true} {
+		for _, privileged := range []bool{false, true} {
 			s := newFakeStore(t)
-			s.privileged = true
+			s.privileged = privileged
 			s.persisted[testKey] = serviceSignerDescriptor(t, genericRead|genericExecute)
 			s.pubErr = zeroErr
-			var err error
-			if open {
-				_, err = openWithPolicy(s, testKey, PolicyServiceSigner)
-			} else {
-				_, err = loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
-			}
+			_, err := openWith(s, testKey, PolicyServiceSigner)
 			if !errors.Is(err, ErrPolicyMismatch) || !errors.Is(err, zeroErr) || errors.Is(err, ErrCleanupFailed) {
-				t.Fatalf("open=%v err = %v", open, err)
+				t.Fatalf("privileged=%v err = %v", privileged, err)
 			}
 			assertNoMutation(t, s)
 			assertHandlesReleased(t, s)
 		}
 	})
 	t.Run("existing key, zero at signer export: no delete", func(t *testing.T) {
-		for _, open := range []bool{false, true} {
+		for _, privileged := range []bool{false, true} {
 			s := newFakeStore(t)
-			s.privileged = true
+			s.privileged = privileged
 			s.persisted[testKey] = serviceSignerDescriptor(t, genericRead|genericExecute)
 			s.signerErr = signerZeroErr
-			var err error
-			if open {
-				_, err = openWithPolicy(s, testKey, PolicyServiceSigner)
-			} else {
-				_, err = loadOrCreateWithPolicy(s, testKey, PolicyServiceSigner)
-			}
+			_, err := openWith(s, testKey, PolicyServiceSigner)
 			if !errors.Is(err, zeroErr) || errors.Is(err, ErrCleanupFailed) {
-				t.Fatalf("open=%v err = %v", open, err)
+				t.Fatalf("privileged=%v err = %v", privileged, err)
 			}
 			assertNoMutation(t, s)
 			assertHandlesReleased(t, s)
 		}
 	})
-	t.Run("existing service-SID key via OpenForService, zero at first export", func(t *testing.T) {
+	t.Run("existing service-SID key via Open, zero at first export", func(t *testing.T) {
 		s := newFakeStore(t)
 		s.persisted[testKey] = s.descriptorFor(servicePolicy.sddl())
 		s.pubErr = zeroErr
-		_, err := openForService(s, testKey, servicePolicy)
+		_, err := openWith(s, testKey, servicePolicy)
 		if !errors.Is(err, ErrPolicyMismatch) || !errors.Is(err, zeroErr) {
 			t.Fatalf("err = %v", err)
 		}
 		assertNoMutation(t, s)
 		assertHandlesReleased(t, s)
 	})
-	t.Run("ApplyPolicy and ApplyServicePolicy, zero at publicKey", func(t *testing.T) {
+	t.Run("Apply, zero at publicKey", func(t *testing.T) {
 		for _, service := range []bool{false, true} {
 			s := newFakeStore(t)
 			s.privileged = true
@@ -912,9 +885,9 @@ func TestPolicyZeroSizeExportComposition(t *testing.T) {
 			s.pubErr = zeroErr
 			var err error
 			if service {
-				err = applyServicePolicy(s, testKey, servicePolicy)
+				err = applyWith(s, testKey, servicePolicy)
 			} else {
-				err = applyPolicy(s, testKey, PolicyPrivilegedOnly)
+				err = applyWith(s, testKey, PolicyPrivilegedOnly)
 			}
 			if !errors.Is(err, ErrPolicyMismatch) || !errors.Is(err, zeroErr) {
 				t.Fatalf("service=%v err = %v, want ErrPolicyMismatch and the zero-size cause (C2)", service, err)
@@ -962,9 +935,9 @@ func (k *racingKey) setSecurityDescriptor(sddl string) error {
 
 // TestOverlappingWritersAreNotCoordinated documents the current outcome, not a
 // guarantee: the package does not serialize writers (see the godoc of
-// ApplyPolicy and ApplyServicePolicy and "Limits to be aware of" in
+// Apply and "Limits to be aware of" in
 // docs/README.md; callers must serialize changes to the same key, also across
-// processes). A reads service-signer; B completes ApplyPolicy(PolicyPrivilegedOnly);
+// processes). A reads service-signer; B completes Apply(PolicyPrivilegedOnly);
 // A then writes the service-SID DACL from its stale read. Both return nil and
 // the final state is service-SID: the service access B removed is granted again.
 // If a coordination is ever added, this test must change with it.
@@ -979,9 +952,9 @@ func TestOverlappingWritersAreNotCoordinated(t *testing.T) {
 
 	var errB error
 	store := &racingStore{fakeStore: inner}
-	store.hook = func() { errB = applyPolicy(inner, testKey, PolicyPrivilegedOnly) }
+	store.hook = func() { errB = applyWith(inner, testKey, PolicyPrivilegedOnly) }
 
-	errA := applyServicePolicy(store, testKey, svc)
+	errA := applyWith(store, testKey, svc)
 
 	if errB != nil || errA != nil {
 		t.Fatalf("B = %v, A = %v; the documented outcome is that both return nil", errB, errA)

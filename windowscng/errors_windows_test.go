@@ -7,9 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"strings"
 	"syscall"
@@ -75,17 +72,6 @@ func TestOpenKeyErrorTexts(t *testing.T) {
 		}
 		requireNCrypt(t, err, "NCryptOpenKey", tc.r)
 	}
-}
-
-func TestLegacyOpenErrorIsTyped(t *testing.T) {
-	o := newFakeLegacyOps(t)
-	o.openHR = NTEPerm
-	_, err := openKeyWith(o, legacyTestKey)
-	if err == nil || err.Error() != `NCryptOpenKey "`+legacyTestKey+`": hr=0x80090010` {
-		t.Fatalf("err = %v", err)
-	}
-	requireNCrypt(t, err, "NCryptOpenKey", NTEPerm)
-	o.requireReleased()
 }
 
 func TestCleanupKeepsBothCauses(t *testing.T) {
@@ -237,7 +223,7 @@ func TestPostWriteVerificationKeepsOnlyNativeCauses(t *testing.T) {
 			s.privileged = true
 			s.persisted[testKey] = serviceSignerDescriptor(t, genericRead)
 			tc.setup(s)
-			err := applyServicePolicy(s, testKey, p)
+			err := applyWith(s, testKey, p)
 			if err == nil || err.Error() != prefix+tc.want {
 				t.Fatalf("err  = %q\nwant = %q", err, prefix+tc.want)
 			}
@@ -297,61 +283,6 @@ func TestPrivilegeCheckKeepsCause(t *testing.T) {
 	}
 	if !errors.Is(err, ErrPrivilegeRequired) || !errors.Is(err, syscall.Errno(5)) {
 		t.Fatalf("sentinel or Win32 cause lost: %v", err)
-	}
-}
-
-// TestWin32CausesReadFromTheSameCall checks, on the source, that the three
-// DACL inspection calls whose failure used to drop the cause now take their
-// last error from the same Proc.Call through win32BOOLAndCallErr, and pass it
-// through win32Cause.
-func TestWin32CausesReadFromTheSameCall(t *testing.T) {
-	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "cng_windows.go", nil, parser.SkipObjectResolution)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var verify *ast.FuncDecl
-	for _, d := range f.Decls {
-		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "verifyDescriptorDACL" {
-			verify = fd
-		}
-	}
-	if verify == nil {
-		t.Fatal("verifyDescriptorDACL not found")
-	}
-	want := map[string]bool{"procGetSecurityDescriptorDacl": false, "procGetAclInformation": false, "procGetAce": false}
-	ast.Inspect(verify, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		fn, ok := call.Fun.(*ast.Ident)
-		if !ok || fn.Name != "win32BOOLAndCallErr" || len(call.Args) != 1 {
-			return true
-		}
-		inner, ok := call.Args[0].(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if sel, ok := inner.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Call" {
-			if id, ok := sel.X.(*ast.Ident); ok {
-				if _, tracked := want[id.Name]; tracked {
-					want[id.Name] = true
-				}
-			}
-		}
-		return true
-	})
-	for name, found := range want {
-		if !found {
-			t.Errorf("%s is not read through win32BOOLAndCallErr in verifyDescriptorDACL", name)
-		}
-	}
-	src := fileText(t, "cng_windows.go")
-	for _, msg := range []string{`"GetSecurityDescriptorDacl failed", win32Cause(callErr)`, `"GetAclInformation failed", win32Cause(callErr)`, `"GetAce(%d) failed", i), win32Cause(callErr)`} {
-		if !strings.Contains(src, msg) {
-			t.Errorf("cng_windows.go: missing %s", msg)
-		}
 	}
 }
 

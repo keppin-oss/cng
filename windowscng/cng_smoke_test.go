@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"testing"
@@ -16,18 +17,28 @@ import (
 const testLifecycleKeyName = "Keppin.OSS.Test.CNG.Lifecycle.v1"
 
 // TestSmokeKeyLifecycle exercises the real persisted machine-scoped key end to
-// end: create/open, sign, verify, delete, confirm absent, and repeat. It is
-// gated behind the cng_smoke build tag and needs a Windows context authorized
-// for the key operations. It is not run by `go test ./...` without that tag.
+// end with the four primitives: create, sign, verify, delete against the
+// recorded SubjectPublicKeyInfo, confirm absent, and repeat. It is gated
+// behind the cng_smoke build tag and needs a privileged Windows context. It is
+// not run by `go test ./...` without that tag.
+//
+// The name is fixed: a key left behind by an interrupted run makes the first
+// Create fail with ErrKeyExists, and that key is never adopted or deleted by
+// this test; it must be inspected and removed by hand.
 func TestSmokeKeyLifecycle(t *testing.T) {
-	// Attempt to acquire the test key. Any acquisition error skips the test, or
-	// fails it when KEPPIN_CNG_SMOKE_REQUIRED=1. This does not establish that the
-	// process lacks elevation.
-	signer, err := LoadOrCreate(testLifecycleKeyName)
+	privileged, err := nativeKeyStore{}.callerPrivileged()
 	if err != nil {
-		smokeUnmet(t, "initial LoadOrCreate failed: %v — lifecycle iterations NOT EXECUTED", err)
+		smokeUnmet(t, "privilege check failed: %v — lifecycle iterations NOT EXECUTED", err)
 	}
-	_ = signer.Close()
+	if !privileged {
+		smokeUnmet(t, "the caller is not privileged (SYSTEM or an elevated Administrator) — lifecycle iterations NOT EXECUTED")
+	}
+	if s, err := Open(testLifecycleKeyName, PolicyServiceSigner); s != nil || !errors.Is(err, ErrKeyNotFound) {
+		if s != nil {
+			_ = s.Close()
+		}
+		t.Fatalf("precondition: Open(%q) = %v, want ErrKeyNotFound; a key left by an earlier run must be removed by hand", testLifecycleKeyName, err)
+	}
 
 	for i := 1; i <= 2; i++ {
 		if err := runLifecycle(testLifecycleKeyName); err != nil {
@@ -37,15 +48,21 @@ func TestSmokeKeyLifecycle(t *testing.T) {
 }
 
 func runLifecycle(name string) error {
-	// 1. create persisted test key using the production profile.
-	signer, err := LoadOrCreate(name)
+	// 1. create the persisted test key.
+	signer, err := Create(name, PolicyServiceSigner)
 	if err != nil {
-		return fmt.Errorf("LoadOrCreate: %w", err)
+		return fmt.Errorf("Create: %w", err)
 	}
 
-	if _, ok := signer.Public().(*ecdsa.PublicKey); !ok {
+	pub, ok := signer.Public().(*ecdsa.PublicKey)
+	if !ok {
 		_ = signer.Close()
 		return fmt.Errorf("Public() = %T, want *ecdsa.PublicKey", signer.Public())
+	}
+	spki, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		_ = signer.Close()
+		return fmt.Errorf("MarshalPKIXPublicKey: %w", err)
 	}
 
 	// 2. sign and verify through crypto.Signer.
@@ -55,7 +72,7 @@ func runLifecycle(name string) error {
 		_ = signer.Close()
 		return fmt.Errorf("sign: %w", err)
 	}
-	if !ecdsa.VerifyASN1(signer.Public().(*ecdsa.PublicKey), digest[:], sig) {
+	if !ecdsa.VerifyASN1(pub, digest[:], sig) {
 		_ = signer.Close()
 		return fmt.Errorf("signature did not verify")
 	}
@@ -65,18 +82,18 @@ func runLifecycle(name string) error {
 		return err
 	}
 
-	// 4. delete the exact key.
-	if err := Delete(name); err != nil {
+	// 4. delete the exact key, verified against the recorded SPKI.
+	if err := Delete(name, PolicyServiceSigner, spki); err != nil {
 		return fmt.Errorf("Delete: %w", err)
 	}
 
 	// 5. verify open-only fails because the key is absent.
-	if _, err := Open(name); !errors.Is(err, ErrKeyNotFound) {
+	if _, err := Open(name, PolicyServiceSigner); !errors.Is(err, ErrKeyNotFound) {
 		return fmt.Errorf("Open after delete = %v, want ErrKeyNotFound", err)
 	}
 
-	// 5b. a repeated delete is idempotent and returns ErrKeyNotFound.
-	if err := Delete(name); !errors.Is(err, ErrKeyNotFound) {
+	// 5b. a repeated delete deletes nothing and returns ErrKeyNotFound.
+	if err := Delete(name, PolicyServiceSigner, spki); !errors.Is(err, ErrKeyNotFound) {
 		return fmt.Errorf("second Delete = %v, want ErrKeyNotFound", err)
 	}
 
