@@ -83,7 +83,6 @@ func assertSentinels(t *testing.T, err error, want ...error) {
 // own handle and without reopening it; a failed delete adds ErrCleanupFailed.
 func TestCreateFailuresWithEveryPolicy(t *testing.T) {
 	exportErr := errors.New("NCryptExportKey: hr=0x80090009")
-	signerErr := errors.New("export public key for " + testKey + ": NCryptExportKey: hr=0x80090009")
 	sdErr := errors.New("synthetic descriptor read failure")
 	deleteErr := ncryptStatusError("NCryptDeleteKey", NTEPerm)
 	for _, p := range allPolicies(t) {
@@ -92,12 +91,10 @@ func TestCreateFailuresWithEveryPolicy(t *testing.T) {
 			setup    func(*fakeStore)
 			cause    error
 			mismatch bool
-			signer   int // signer() calls expected
 		}{
-			{"first public-key export fails", func(s *fakeStore) { s.pubErr = exportErr }, exportErr, true, 0},
-			{"second public-key export (signer) fails", func(s *fakeStore) { s.signerErr = signerErr }, signerErr, false, 1},
-			{"first descriptor read fails", func(s *fakeStore) { s.sdErr = sdErr }, sdErr, false, 0},
-			{"created key reads back in another state", func(s *fakeStore) { s.writeResult = otherDescriptor(t, p) }, nil, true, 0},
+			{"public-key export fails", func(s *fakeStore) { s.pubErr = exportErr }, exportErr, true},
+			{"first descriptor read fails", func(s *fakeStore) { s.sdErr = sdErr }, sdErr, false},
+			{"created key reads back in another state", func(s *fakeStore) { s.writeResult = otherDescriptor(t, p) }, nil, true},
 		} {
 			for _, deleteFails := range []bool{false, true} {
 				name := policyLabel(p) + ": " + tc.name
@@ -132,8 +129,8 @@ func TestCreateFailuresWithEveryPolicy(t *testing.T) {
 					if tc.cause == sdErr && (!strings.Contains(err.Error(), "descriptor unavailable") || strings.Contains(err.Error(), "persisted_sd_dacl_hex=")) {
 						t.Fatalf("err = %v, a read failure must not fabricate descriptor evidence", err)
 					}
-					if len(s.creates) != 1 || s.signerCalls != tc.signer || s.opens != 0 {
-						t.Fatalf("creates=%d signerCalls=%d opens=%d, want 1/%d/0", len(s.creates), s.signerCalls, s.opens, tc.signer)
+					if len(s.creates) != 1 || s.signerCalls != 0 || s.opens != 0 {
+						t.Fatalf("creates=%d signerCalls=%d opens=%d, want 1/0/0: no signer for a key that failed verification", len(s.creates), s.signerCalls, s.opens)
 					}
 					if len(s.deletedKeys) != 1 || !s.deletedKeys[0].created {
 						t.Fatalf("deletedKeys = %v, want exactly the created key object, once", s.deletedKeys)
@@ -152,15 +149,15 @@ func TestCreateFailuresWithEveryPolicy(t *testing.T) {
 // new key to the name after the create, the rollback deletes the object it
 // created, through its handle, and leaves the replacement in place.
 func TestCreateRollbackKeepsAReplacementUnderTheName(t *testing.T) {
-	signerErr := errors.New("export public key for " + testKey + ": NCryptExportKey: hr=0x80090009")
+	exportErr := errors.New("NCryptExportKey: hr=0x80090009")
 	for _, p := range allPolicies(t) {
-		for _, failure := range []string{"signer fails", "verification fails"} {
+		for _, failure := range []string{"public-key export fails", "verification fails"} {
 			t.Run(policyLabel(p)+": "+failure, func(t *testing.T) {
 				s := newFakeStore(t)
 				s.privileged = true
 				replacement := matchingDescriptor(t, p)
-				if failure == "signer fails" {
-					s.signerErr = signerErr
+				if failure == "public-key export fails" {
+					s.pubErr = exportErr
 				} else {
 					s.writeResult = otherDescriptor(t, p)
 				}
@@ -207,42 +204,28 @@ func TestOpenNativeFailureIsReturnedUnchanged(t *testing.T) {
 }
 
 // TestOpenExportFailuresWithEveryPolicy: on an existing key in the right
-// state, a failed first export is ErrPolicyMismatch and a failed second export
-// (signer) is returned as is; the key is never created, written or deleted.
+// state, a failed public-key export (the only one Open makes) is
+// ErrPolicyMismatch with the export cause; the key is never created, written
+// or deleted and no signer is built.
 func TestOpenExportFailuresWithEveryPolicy(t *testing.T) {
 	exportErr := errors.New("NCryptExportKey: hr=0x80090009")
-	signerErr := errors.New("export public key for " + testKey + ": NCryptExportKey: hr=0x80090009")
 	for _, p := range allPolicies(t) {
-		for _, first := range []bool{true, false} {
-			label := "second export (signer) fails"
-			if first {
-				label = "first export fails"
+		t.Run(policyLabel(p)+": public-key export fails", func(t *testing.T) {
+			s := newFakeStore(t)
+			s.privileged = true
+			s.persisted[testKey] = matchingDescriptor(t, p)
+			s.pubErr = exportErr
+			signer, err := openWith(s, testKey, p)
+			if signer != nil || !errors.Is(err, exportErr) {
+				t.Fatalf("signer=%v err=%v, want no signer and the export cause", signer, err)
 			}
-			t.Run(policyLabel(p)+": "+label, func(t *testing.T) {
-				s := newFakeStore(t)
-				s.privileged = true
-				s.persisted[testKey] = matchingDescriptor(t, p)
-				if first {
-					s.pubErr = exportErr
-				} else {
-					s.signerErr = signerErr
-				}
-				_, err := openWith(s, testKey, p)
-				if first {
-					if !errors.Is(err, exportErr) {
-						t.Fatalf("err = %v, want the export cause", err)
-					}
-					assertSentinels(t, err, ErrPolicyMismatch)
-				} else {
-					if !errors.Is(err, signerErr) {
-						t.Fatalf("err = %v, want the signer cause", err)
-					}
-					assertSentinels(t, err) // the signer cause only
-				}
-				assertNoMutation(t, s)
-				assertHandlesReleased(t, s)
-			})
-		}
+			assertSentinels(t, err, ErrPolicyMismatch)
+			if s.pubReads != 1 || s.signerCalls != 0 {
+				t.Fatalf("pubReads=%d signerCalls=%d, want 1/0", s.pubReads, s.signerCalls)
+			}
+			assertNoMutation(t, s)
+			assertHandlesReleased(t, s)
+		})
 	}
 }
 

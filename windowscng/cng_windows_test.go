@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -400,18 +401,22 @@ func TestExportPublicKeyZeroAndBounds(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
-	t.Run("query 80, written 72, valid blob: success", func(t *testing.T) {
-		data := append(validP256Blob(), 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE)
-		pub, err := runFakeExport(t,
-			exportStep{result: 80},
-			exportStep{fill: true, wantCap: 80, result: 72, data: data})
-		if err != nil {
-			t.Fatalf("err = %v", err)
-		}
-		if pub.Curve != elliptic.P256() || pub.X.Cmp(elliptic.P256().Params().Gx) != 0 || pub.Y.Cmp(elliptic.P256().Params().Gy) != 0 {
-			t.Fatal("unexpected public key")
-		}
-	})
+	// A query above the 72-byte P-256 blob is refused before the buffer is
+	// allocated and before the fill: runFakeExport fails on a second call.
+	// Earlier versions accepted an oversized query and parsed the written
+	// prefix; that tolerance is gone.
+	for _, queried := range []uint32{maxECCPublicBlobSize + 1, 80, 0x80000000, 0xFFFFFFFF} {
+		t.Run(fmt.Sprintf("query %d above the limit: error, no fill", queried), func(t *testing.T) {
+			_, err := runFakeExport(t, exportStep{result: queried})
+			want := fmt.Sprintf("NCryptExportKey (query size): reported size %d exceeds the limit of 72 bytes", queried)
+			if err == nil || err.Error() != want {
+				t.Fatalf("err = %v, want %q", err, want)
+			}
+			if ne := (*NCryptError)(nil); errors.As(err, &ne) {
+				t.Fatalf("err = %v carries *NCryptError, want a local size error", err)
+			}
+		})
+	}
 	t.Run("valid blob in buffer, written 71: truncated", func(t *testing.T) {
 		_, err := runFakeExport(t,
 			exportStep{result: 72},

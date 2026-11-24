@@ -191,8 +191,11 @@ type storedKey interface {
 	publicKey() (*ecdsa.PublicKey, error)
 	securityDescriptor() ([]byte, error)
 	setSecurityDescriptor(sddl string) error
-	// signer transfers ownership of the handles to the returned Signer.
-	signer() (Signer, error)
+	// signer transfers ownership of the handles to the returned Signer, whose
+	// Public returns pub: the public key already read and verified on this
+	// handle by checkKeyPolicyPublic. It makes no native call and cannot fail,
+	// so a verified key is never lost to a second read.
+	signer(pub *ecdsa.PublicKey) Signer
 	// deleteAndRelease deletes the key behind this handle and ends its
 	// lifetime: NCryptDeleteKey consumes the key handle on success, a failed
 	// delete frees it once, and the provider is released either way. It is
@@ -263,14 +266,10 @@ func requirePrivilege(ks keyStore) error {
 	return nil
 }
 
-// checkKeyPolicy validates key profile and DACL state without modifying the key.
-func checkKeyPolicy(k storedKey, s policySpec) error {
-	_, err := checkKeyPolicyPublic(k, s)
-	return err
-}
-
-// checkKeyPolicyPublic is checkKeyPolicy that also returns the public key it
-// read and validated, so that a caller needing it does not read it twice.
+// checkKeyPolicyPublic validates key profile and DACL state without modifying
+// the key, and returns the public key it read and validated: Open and Create
+// build the signer from it, and Delete compares it with the expected
+// SubjectPublicKeyInfo, so the public key is exported once per call.
 func checkKeyPolicyPublic(k storedKey, s policySpec) (*ecdsa.PublicKey, error) {
 	if err := k.verifyNonExportable(); err != nil {
 		return nil, err
@@ -311,16 +310,12 @@ func descriptorMismatch(sd []byte, reason string) error {
 }
 
 func signerWithPolicy(k storedKey, name string, s policySpec) (Signer, error) {
-	if err := checkKeyPolicy(k, s); err != nil {
+	pub, err := checkKeyPolicyPublic(k, s)
+	if err != nil {
 		k.close()
 		return nil, fmt.Errorf("key %q (%s): %w", name, s.label, err)
 	}
-	signer, err := k.signer()
-	if err != nil {
-		k.close()
-		return nil, err
-	}
-	return signer, nil
+	return k.signer(pub), nil
 }
 
 // resolvePolicy turns a KeyPolicy into the engine's policySpec. It accepts
@@ -382,7 +377,8 @@ func openSpec(ks keyStore, name string, s policySpec) (Signer, error) {
 // and the delete outcome is reported (ErrCleanupFailed when not confirmed).
 // It is used by Create.
 func finishCreated(k storedKey, name string, s policySpec) (Signer, error) {
-	if err := checkKeyPolicy(k, s); err != nil {
+	pub, err := checkKeyPolicyPublic(k, s)
+	if err != nil {
 		// The key was created by this call and does not hold the requested
 		// policy (for example because of provider canonicalization): remove it
 		// rather than leave a key in an unverified state. A DACL mismatch error
@@ -391,15 +387,9 @@ func finishCreated(k storedKey, name string, s policySpec) (Signer, error) {
 		// ErrCleanupFailed and the unverified key may persist.
 		return nil, fmt.Errorf("created key %q failed %s verification: %w", name, s.label, cleanupCreatedKey(err, k.deleteAndRelease))
 	}
-	signer, err := k.signer()
-	if err != nil {
-		// The key was created by this call and a failed signer() leaves its
-		// handles with k: delete it through the same handle, never by name.
-		// deleteAndRelease ends k's lifetime (delete consumes or frees the key
-		// handle, then the provider is released), so k.close is not called.
-		return nil, cleanupCreatedKey(err, k.deleteAndRelease)
-	}
-	return signer, nil
+	// The verified key becomes the signer with the public key read above: no
+	// further native call can fail between verification and success.
+	return k.signer(pub), nil
 }
 
 // validateKeyName rejects, before any native call, a name that cannot be an
@@ -653,13 +643,10 @@ func (k *nativeKey) setSecurityDescriptor(sddl string) error {
 	return setSecurityDescriptor(k.key, sd)
 }
 
-func (k *nativeKey) signer() (Signer, error) {
-	s, err := newCNGSigner(k.provider, k.key, k.name)
-	if err != nil {
-		return nil, err
-	}
+func (k *nativeKey) signer(pub *ecdsa.PublicKey) Signer {
+	s := &cngSigner{provider: k.provider, key: k.key, name: k.name, publicKey: pub}
 	k.provider, k.key = 0, 0
-	return s, nil
+	return s
 }
 
 func (k *nativeKey) deleteAndRelease() error {

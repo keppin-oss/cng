@@ -32,6 +32,16 @@
 // and makes at most one release attempt per handle; see Signer for the full
 // contract.
 //
+// Native reads first ask the provider for the size of the result and refuse a
+// size above a limit before allocating, with an error that names the
+// operation, the reported size and the limit (no sentinel). Two limits follow
+// from the P-256 formats: 64 bytes for a signature (IEEE P1363, r || s) and 72
+// bytes for the public key (ECCPUBLICBLOB: an 8-byte header and the
+// coordinates). The third, 128 KiB for the DACL-only security descriptor, is a
+// budget rather than a limit of the format: such a descriptor is a 20-byte
+// header plus an ACL of at most 65535 bytes. An oversized descriptor is a
+// failed read, never ErrPolicyMismatch.
+//
 // The package is Windows-only. It does not implement X.509, certificate-store,
 // enrollment, trust-store, or orchestration behavior.
 package windowscng

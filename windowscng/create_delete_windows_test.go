@@ -216,19 +216,6 @@ func TestCreateContract(t *testing.T) {
 		}
 		assertHandlesReleased(t, s)
 	})
-	t.Run("signer construction fails: created key deleted on the same handle", func(t *testing.T) {
-		s := newFakeStore(t)
-		s.privileged = true
-		s.signerErr = errors.New("second export failed")
-		_, err := createWith(s, testKey, p)
-		if err == nil || errors.Is(err, ErrCleanupFailed) || s.signerCalls != 1 {
-			t.Fatalf("err=%v signerCalls=%d", err, s.signerCalls)
-		}
-		if len(s.deletedKeys) != 1 || !s.deletedKeys[0].created {
-			t.Fatalf("deleted = %v", s.deleted)
-		}
-		assertHandlesReleased(t, s)
-	})
 }
 
 func TestDeleteContract(t *testing.T) {
