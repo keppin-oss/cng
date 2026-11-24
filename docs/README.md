@@ -243,6 +243,12 @@ and the `NTE*` codes are declared on every platform, so shared code compiles
 on Windows and elsewhere; outside Windows the functions only report that the
 platform is not supported.
 
+`ExampleApply_errorHandling` (in the package documentation, source
+[`windowscng/example_apply_errors_test.go`](../windowscng/example_apply_errors_test.go))
+checks the outcome of `Apply` in the right order: `ErrPostWriteVerification`
+first (written but unverified: inspect, never retry or regenerate), then the
+sentinels that mean the DACL was not written, then the native code.
+
 **Native causes.** Every failed NCrypt call is reachable as an
 `*NCryptError` with `errors.As`: `Code` is the 32-bit `SECURITY_STATUS`
 (compare it with `NTENotFound`, `NTEPerm`, `NTEBadKeyset` or another value),
@@ -302,6 +308,19 @@ if errors.As(err, &ne) && ne.Code == windowscng.NTEPerm {
   - record the `SubjectPublicKeyInfo` of the returned key and compare it at
     every later open: a mismatch is a conflict (possible tampering) to report,
     never a key to adopt or to delete by name.
+- **Size limits on native reads.** Each read first asks the provider for the
+  size, then allocates. A size above the limit is refused before any
+  allocation, with an error naming the operation, the reported size and the
+  limit (no new sentinel):
+  - signature (`NCryptSignHash`): 64 bytes, a P-256 signature in IEEE P1363
+    form;
+  - public key (`NCryptExportKey`, `ECCPUBLICBLOB`): 72 bytes, the 8-byte header
+    and the P-256 coordinates. A provider that reports a larger buffer for a
+    valid blob is no longer accepted;
+  - security descriptor (DACL only): 128 KiB. This is a budget, not a limit of
+    the format: a DACL-only self-relative descriptor is a 20-byte header plus
+    an ACL of at most 65535 bytes. An oversized descriptor is a failed read
+    ("descriptor unavailable"), never `ErrPolicyMismatch`.
 
   A writer that does not take part in that serialization (another software,
   an administrator acting on the same names) is outside the guarantee; the

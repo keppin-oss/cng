@@ -219,10 +219,21 @@ func getSecurityDescriptor(keyHandle uintptr) ([]byte, error) {
 	return getSecurityDescriptorWith(keyHandle, nativeGetProperty)
 }
 
+// maxSecurityDescriptorSize bounds the buffer allocated for the DACL-only
+// security descriptor before it is read. It is a budget, not a limit of the
+// format: a self-relative descriptor holding only a DACL is a 20-byte header
+// plus an ACL whose size field is 16 bits (at most 65535 bytes), so 128 KiB
+// leaves a wide margin for any DACL Windows can store while keeping a bogus
+// size from forcing a multi-GiB allocation (or a panic on 386). The policies
+// of this package need well under 200 bytes.
+const maxSecurityDescriptorSize = 128 << 10
+
 // getSecurityDescriptorWith queries the size, fills a buffer of that size and
 // returns only the bytes the fill reports as written. A nonzero status always
-// wins; a zero size from the query, and a fill that reports zero bytes or more
-// bytes than the buffer, are errors.
+// wins; a zero size or a size above maxSecurityDescriptorSize from the query,
+// and a fill that reports zero bytes or more bytes than the buffer, are errors.
+// An oversized query is a read failure, reported before any allocation and
+// before the fill; it never describes the DACL.
 func getSecurityDescriptorWith(keyHandle uintptr, get ncryptGetPropertyFunc) ([]byte, error) {
 	var propLen uint32
 	r := get(keyHandle, "Security Descr", nil, &propLen, daclSecurityInformation)
@@ -231,6 +242,9 @@ func getSecurityDescriptorWith(keyHandle uintptr, get ncryptGetPropertyFunc) ([]
 	}
 	if propLen == 0 {
 		return nil, fmt.Errorf("cannot read persisted security descriptor: reported size 0")
+	}
+	if propLen > maxSecurityDescriptorSize {
+		return nil, fmt.Errorf("cannot read persisted security descriptor: reported size %d exceeds the limit of %d bytes", propLen, maxSecurityDescriptorSize)
 	}
 
 	buf := make([]byte, propLen)
@@ -607,14 +621,6 @@ type cngSigner struct {
 	native    signerNative // nil means nativeSignerOps
 }
 
-func newCNGSigner(provider, key uintptr, name string) (*cngSigner, error) {
-	pub, err := exportPublicKey(key)
-	if err != nil {
-		return nil, fmt.Errorf("export public key for %s: %w", name, err)
-	}
-	return &cngSigner{provider: provider, key: key, name: name, publicKey: pub}, nil
-}
-
 func (s *cngSigner) ops() signerNative {
 	if s.native != nil {
 		return s.native
@@ -622,8 +628,9 @@ func (s *cngSigner) ops() signerNative {
 	return nativeSignerOps{}
 }
 
-// Public returns the public key exported when the signer was built. It needs
-// no handle and stays valid after Close.
+// Public returns the public key that Open or Create read and verified on the
+// key handle before building the signer. It needs no handle and stays valid
+// after Close.
 func (s *cngSigner) Public() crypto.PublicKey { return s.publicKey }
 
 // Sign signs digest with the CNG key. It is safe to call concurrently with
@@ -647,6 +654,11 @@ func (s *cngSigner) Sign(_ io.Reader, digest []byte, _ crypto.SignerOpts) ([]byt
 	}
 	if sigSize == 0 {
 		return nil, fmt.Errorf("NCryptSignHash (query size): reported size 0")
+	}
+	// A P-256 P1363 signature is exactly 64 bytes: refuse a larger query
+	// before allocating the buffer.
+	if sigSize > maxP1363SignatureSize {
+		return nil, fmt.Errorf("NCryptSignHash (query size): reported size %d exceeds the limit of %d bytes", sigSize, maxP1363SignatureSize)
 	}
 
 	sigBuf := make([]byte, sigSize)
@@ -724,12 +736,23 @@ func exportPublicKey(key uintptr) (*ecdsa.PublicKey, error) {
 	return exportPublicKeyWith(key, nativeExportECCPublicBlob)
 }
 
+// Size limits checked against the size query before a buffer is allocated.
+// Both follow from the P-256 formats the package accepts.
+const (
+	// maxP1363SignatureSize is r || s, two 32-byte P-256 integers.
+	maxP1363SignatureSize = 2 * ecdsaP256CoordinateSize
+	// maxECCPublicBlobSize is the 8-byte BCRYPT_ECCKEY_BLOB header (magic,
+	// cbKey) followed by the X and Y coordinates of a P-256 key.
+	maxECCPublicBlobSize = 8 + 2*ecdsaP256CoordinateSize
+)
+
 // exportPublicKeyWith queries the size of the ECC public blob, fills a buffer
 // of that capacity and parses only the bytes the fill reports as written.
-// A nonzero status always wins and keeps its phase and code. A zero size from
-// a successful query, and a fill that reports zero bytes or more bytes than
-// the capacity, are returned as errors before the buffer is used. It never
-// retries and never releases or deletes the key.
+// A nonzero status always wins and keeps its phase and code. A zero size or a
+// size above maxECCPublicBlobSize from a successful query, and a fill that
+// reports zero bytes or more bytes than the capacity, are returned as errors
+// before the buffer is used. It never retries and never releases or deletes
+// the key.
 func exportPublicKeyWith(key uintptr, export ncryptExportFunc) (*ecdsa.PublicKey, error) {
 	var queried uint32
 	if r := export(key, nil, &queried); r != 0 {
@@ -737,6 +760,9 @@ func exportPublicKeyWith(key uintptr, export ncryptExportFunc) (*ecdsa.PublicKey
 	}
 	if queried == 0 {
 		return nil, fmt.Errorf("NCryptExportKey (query size): reported size 0")
+	}
+	if queried > maxECCPublicBlobSize {
+		return nil, fmt.Errorf("NCryptExportKey (query size): reported size %d exceeds the limit of %d bytes", queried, maxECCPublicBlobSize)
 	}
 
 	blob := make([]byte, queried)

@@ -428,18 +428,27 @@ func TestSignerSignErrorPaths(t *testing.T) {
 		setup         func(f *fakeSignerNative)
 		wantErr       string
 		wantSignCalls int
+		// wantOp and wantCode: the native failure must be the first
+		// *NCryptError in the chain with this Op and Code. Empty wantOp: the
+		// error is a validation error and carries no *NCryptError.
+		wantOp   string
+		wantCode uint32
 	}{
-		{"size query fails", func(f *fakeSignerNative) { f.sizeHR = 0x80090016 }, "query size): hr=0x80090016", 0},
-		{"size query reports zero", func(f *fakeSignerNative) { f.sizeOut = 0 }, "reported size 0", 0},
-		{"sign fails", func(f *fakeSignerNative) { f.signHR = 0x8009000b }, "NCryptSignHash: hr=0x8009000b", 1},
-		{"sign reports size beyond buffer", func(f *fakeSignerNative) { f.writeOut = 65 }, "exceeds buffer", 1},
+		{"size query fails", func(f *fakeSignerNative) { f.sizeHR = 0x80090016 }, "query size): hr=0x80090016", 0, "NCryptSignHash (query size)", 0x80090016},
+		{"size query reports zero", func(f *fakeSignerNative) { f.sizeOut = 0 }, "reported size 0", 0, "", 0},
+		{"sign fails", func(f *fakeSignerNative) { f.signHR = 0x8009000b }, "NCryptSignHash: hr=0x8009000b", 1, "NCryptSignHash", 0x8009000b},
+		{"sign reports size beyond buffer", func(f *fakeSignerNative) { f.writeOut = 65 }, "exceeds buffer", 1, "", 0},
 		// F5: extreme sizes from the second call, with a 64-byte buffer from the
 		// first. int(0x80000000) is negative on 32-bit Windows; the check must
 		// still return an error instead of slicing out of range.
-		{"sign reports size 0x80000000", func(f *fakeSignerNative) { f.writeOut = 0x80000000 }, "reported size 2147483648 exceeds buffer 64", 1},
-		{"sign reports size 0xFFFFFFFF", func(f *fakeSignerNative) { f.writeOut = 0xFFFFFFFF }, "reported size 4294967295 exceeds buffer 64", 1},
-		{"sign reports short signature", func(f *fakeSignerNative) { f.writeOut = 63 }, "P1363 signature length = 63", 1},
-		{"size query reports wrong length", func(f *fakeSignerNative) { f.sizeOut, f.writeOut = 72, 72 }, "P1363 signature length = 72", 1},
+		{"sign reports size 0x80000000", func(f *fakeSignerNative) { f.writeOut = 0x80000000 }, "reported size 2147483648 exceeds buffer 64", 1, "", 0},
+		{"sign reports size 0xFFFFFFFF", func(f *fakeSignerNative) { f.writeOut = 0xFFFFFFFF }, "reported size 4294967295 exceeds buffer 64", 1, "", 0},
+		{"sign reports short signature", func(f *fakeSignerNative) { f.writeOut = 63 }, "P1363 signature length = 63", 1, "", 0},
+		// A query above the 64-byte P-256 P1363 signature is refused before
+		// the buffer is allocated and before the second call.
+		{"size query above the limit by one", func(f *fakeSignerNative) { f.sizeOut, f.writeOut = 65, 65 }, "NCryptSignHash (query size): reported size 65 exceeds the limit of 64 bytes", 0, "", 0},
+		{"size query 0x80000000", func(f *fakeSignerNative) { f.sizeOut = 0x80000000 }, "NCryptSignHash (query size): reported size 2147483648 exceeds the limit of 64 bytes", 0, "", 0},
+		{"size query 0xFFFFFFFF", func(f *fakeSignerNative) { f.sizeOut = 0xFFFFFFFF }, "NCryptSignHash (query size): reported size 4294967295 exceeds the limit of 64 bytes", 0, "", 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -449,6 +458,13 @@ func TestSignerSignErrorPaths(t *testing.T) {
 			_, err := s.Sign(nil, fx.digest, nil)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("err = %v, want containing %q", err, tc.wantErr)
+			}
+			if tc.wantOp != "" {
+				// The text alone would also match a plain string that lost the
+				// typed cause.
+				assertNCryptOpCode(t, err, tc.wantOp, tc.wantCode)
+			} else if ne := (*NCryptError)(nil); errors.As(err, &ne) {
+				t.Fatalf("err = %v carries *NCryptError %+v, want a validation error", err, ne)
 			}
 			if snap := f.snapshot(); snap.signCalls != tc.wantSignCalls || snap.keyFrees != 0 {
 				t.Fatalf("after error: signCalls=%d keyFrees=%d", snap.signCalls, snap.keyFrees)
